@@ -22,6 +22,7 @@ from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     butterfly,
+    clock,
     fp8_pack4,
     peer_bases,
     rsrc,
@@ -64,6 +65,7 @@ class MonoBuild(msgspec.Struct, frozen=True):
     tokens: int
     tp: int
     kt: bool = False  # K1 also writes K2's key table
+    timeline: bool = False  # record the stage marks (K2_TL; a measurement build)
     # K1's seam folds the previous layer's owed post into the residual; off where
     # the residual arrives settled (the first layer, after an Engram write)
     fold: bool = True
@@ -149,6 +151,30 @@ def peer_half_bytes(tp: int) -> int:
 
 def _epoch(epoch):
     return fx.Int32(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32))
+
+
+def tl_base(key: MonoBuild, layout: dict, scratch):
+    """A timeline build's stage-mark table: 32 words a CTA past the scratch layout."""
+    if not key.timeline:
+        return None
+    return scratch + fx.Int64(max(o + n for o, n in layout.values()))
+
+
+@flyc.jit
+def tl_stamp(c, point):
+    """``stamp`` for the FFN stages (``c["tl"]`` set by a timeline build only)."""
+    if const_expr(c.get("tl") is not None):
+        if c["tid"] == 0:
+            bo.buffer_store(
+                fx.Int32(clock()),
+                rsrc(c["tl"]),
+                bid_of(c) * 32 + point,
+                cache_modifier=CM_DEV,
+            )
+
+
+def bid_of(c):
+    return c["bid"] if "bid" in c else fx.block_idx.x
 
 
 # ---------------------------------------------------------------- K1
@@ -565,19 +591,25 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own
     )
     cb["tag"] = ep & 255
+    ca["tl"] = tl_base(key, layout, scratch)
+    cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
         cb[region] = sreg(a["epoch"], 4 * (EPOCH_COUNTERS + i * moe.TAGS), region)
+    tl_stamp(ca, 20)
     for task in range(first_task(bid, 0), SLICES, BLOCKS):
         # the slice's own loads go out ahead of the wait on the ranks' partials
         pre = seam.slice_prefetch(ca, task)
         if const_expr(part is not None):
             seam.stage_push(ca, task, part)
         seam.stage_reduce(ca, task)
+        tl_stamp(ca, 16)
         seam.stage_slice(ca, task, pre)
+    tl_stamp(ca, 21)
     for t in range(first_task(bid, NORM0), s, BLOCKS):
         seam.stage_norm(ca, t, lambda *v: store_normed(normed, *v))
         publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
     gpu.barrier()
+    tl_stamp(ca, 22)
 
     def gates():
         # the next seam's mixes: only the next launch reads them, so they wait
@@ -588,7 +620,9 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
             seam.stage_gate(ca, t)
 
     # ---- the MoE, its all-reduce into ``out``
+    tl_stamp(cb, 23)
     moe.run_moe(cb, mkey, bid, before_ug=gates)
+    tl_stamp(cb, 24)
 
     def reset():
         # the MoE counter slot 128 launch pairs ahead: its last use is long done
@@ -597,6 +631,7 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
             gstore(cb[region].value + fx.Int64(slot * 4), fx.Int32(0), words=1)
 
     epoch_end({"bid": bid, "tid": tid}, a["epoch"], ep, reset)
+    tl_stamp(cb, 25)
 
 
 def build_mono_ffn(key: MonoBuild):
@@ -897,6 +932,7 @@ def build_mono_k2(key: MonoBuild):
             blayout = {n: layout[n] for n in back_scratch(s, Dims(tp))}
             views = {"split": lds.split.peek(), "gemv": lds.gemv.peek()}
             c = mb_back.back_context(bkey, views, bargs, scratch, tag, blayout)
+            c["tl"] = tl_base(key, layout, scratch)
             amb = Mailbox(tag)
 
             def push(t, col, v0, v1):

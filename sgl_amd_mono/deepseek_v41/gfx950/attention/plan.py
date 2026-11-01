@@ -131,7 +131,7 @@ def front_scratch(s: int, d: Dims) -> dict:
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
     ck = (
-        64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+        64 if s * cdiv(KEYS, 64) <= 256 else 128
     )  # back.chunk_keys
     nchunk = cdiv(KEYS, ck)
     return byte_layout(

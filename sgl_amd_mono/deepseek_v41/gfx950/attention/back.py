@@ -112,9 +112,17 @@ def head_groups(d: Dims, s: int) -> int:
     return 2 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= BLOCKS else 1
 
 
+def key_tiles(d: Dims, s: int) -> int:
+    """16-key tiles a split unit's chunk: half the waves' worth while the
+    smaller (64-key) chunks' units fit the grid. With one head tile the other
+    waves sit out the QK (they still run the PV); the chunk halves, so twice
+    the tokens' chunks share the grid."""
+    return WAVES // 2 if s * cdiv(KEYS, 64) <= BLOCKS else WAVES
+
+
 def chunk_keys(d: Dims, s: int) -> int:
     """A split unit's keys: a 16-key tile a wave of a head group."""
-    return 16 * (WAVES // head_groups(d, s))
+    return 16 * key_tiles(d, s)
 
 
 def p_row(d: Dims, s: int) -> int:
@@ -201,10 +209,13 @@ def stage_split(c, unit):
     ch = unit % nchunk
     ck = chunk_keys(d, s)
     ngrp = head_groups(d, s)
-    nkt = WAVES // ngrp  # 16-key tiles a chunk
+    nkt = key_tiles(d, s)  # 16-key tiles a chunk
     nht = d.head_tiles // ngrp  # head tiles a wave
     hgi = wave // nkt
     kt = wave % nkt
+    qkw = hgi < ngrp  # a wave with a head tile: all, unless a one-tile build's
+    # halved chunk leaves waves 4.. only the PV (their QK / softmax would index
+    # a head tile that is not there)
     g = lane // 16
     r16 = lane % 16
     k0 = ch * ck
@@ -232,16 +243,22 @@ def stage_split(c, unit):
         )
     if k0 < kv_len:
         # a key's 448 e4m3 as 7 x 16 B (lane g: dims 64 c + 16 g ..), its 64
-        # bf16 rope dims as 2 x 16 B (32 c + 8 g ..), its 7 scale bytes
-        scw = global_load(sc, words=2)
-        nope = [
-            global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
-            for c4 in range(NOPE // 64)
-        ]
-        rope = [
-            global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
-            for cc in range(ROPE // 32)
-        ]
+        # bf16 rope dims as 2 x 16 B (32 c + 8 g ..), its 7 scale bytes; only a
+        # wave with a head tile loads them (its QK dequantizes them, and head
+        # group 0's waves store them to LDS for the PV)
+        scw = fx.Vector.filled(2, 0, fx.Int32)
+        nope = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(NOPE // 64)]
+        rope = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(ROPE // 32)]
+        if qkw:
+            scw = global_load(sc, words=2)
+            nope = [
+                global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
+                for c4 in range(NOPE // 64)
+            ]
+            rope = [
+                global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
+                for cc in range(ROPE // 32)
+            ]
         # q of every head into LDS (bf16 rows of 512 + pad), 16 B a thread
         for i in range_constexpr(cdiv(qrow, THREADS)):
             u = fresh(tid) + THREADS * i
@@ -265,68 +282,84 @@ def stage_split(c, unit):
         stamp(c, 5)
         # QK: A = the keys (dequantized once), B = q of a head tile (LDS); the
         # contraction's 32-dim chunk 2 c + h of the nope dims is {64 c + 16 g +
-        # 8 h ..} (lane g's 16 B load), q read in the same order
+        # 8 h ..} (lane g's 16 B load), q read in the same order. A wave without
+        # a head tile skips it: its scores would index a tile that is not there.
         scale = a["qk_scale"].bitcast(fx.Float32)
         st = sl["st"]
-        accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nht)]
-        for c4 in range_constexpr(NOPE // 64):
-            ksc = pow2(_scale_byte(scw, c4))
-            for h2 in range_constexpr(2):
-                kw = fp8x8_bf16(nope[c4][2 * h2], nope[c4][2 * h2 + 1], ksc).bitcast(
-                    fx.BFloat16
-                )
-                for ht in range_constexpr(nht):
-                    qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
-                    qw = fx.ptr_load(
-                        qb + 32 * c4 + 8 * g + 4 * h2,
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
-                    accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
-        for cc in range_constexpr(ROPE // 32):
-            kw = rope[cc].bitcast(fx.BFloat16)
-            for ht in range_constexpr(nht):
-                qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
-                qw = fx.ptr_load(
-                    qb + (NOPE + cc * 32 + 8 * g) // 2,
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
-                accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
-        # scores of keys 4 g + i (C rows), head r16 of a tile (C column)
         ok = (key < kv_len) & okv
         okw = ok.select(fx.Int32(1), fx.Int32(0))
         valid = [lane_gather(okw, 4 * g + i) != 0 for i in range(4)]
-        svs = []
-        for ht in range_constexpr(nht):
-            sv = [
-                valid[i].select(accs[ht][i] * scale, fx.Float32(NEG)) for i in range(4)
-            ]
-            mw = butterfly(
-                fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])), (32, 16), fx.max
-            )
-            if g == 0:
-                fx.ptr_store(mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16)
-            svs.append(sv)
+        svs = [[fx.Float32(0.0) for _ in range(4)] for _ in range(nht)]
+        if qkw:
+            accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nht)]
+            for c4 in range_constexpr(NOPE // 64):
+                ksc = pow2(_scale_byte(scw, c4))
+                for h2 in range_constexpr(2):
+                    kw = fp8x8_bf16(
+                        nope[c4][2 * h2], nope[c4][2 * h2 + 1], ksc
+                    ).bitcast(fx.BFloat16)
+                    for ht in range_constexpr(nht):
+                        qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
+                        qw = fx.ptr_load(
+                            qb + 32 * c4 + 8 * g + 4 * h2,
+                            result_type=fx.Vector.make_type(4, fx.Int32),
+                        )
+                        accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
+            for cc in range_constexpr(ROPE // 32):
+                kw = rope[cc].bitcast(fx.BFloat16)
+                for ht in range_constexpr(nht):
+                    qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
+                    qw = fx.ptr_load(
+                        qb + (NOPE + cc * 32 + 8 * g) // 2,
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                    accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
+            # scores of keys 4 g + i (C rows), head r16 of a tile (C column)
+            svs = []
+            for ht in range_constexpr(nht):
+                sv = [
+                    valid[i].select(accs[ht][i] * scale, fx.Float32(NEG))
+                    for i in range(4)
+                ]
+                mw = butterfly(
+                    fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])),
+                    (32, 16),
+                    fx.max,
+                )
+                if g == 0:
+                    fx.ptr_store(
+                        mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16
+                    )
+                svs.append(sv)
         gpu.barrier()
         lst = st + d.heads * nkt
-        for ht in range_constexpr(nht):
-            hti = hgi * nht + ht
-            m = fx.ptr_load(st + (hti * nkt) * HEAD_TILE + r16)
-            for j in range_constexpr(1, nkt):
-                m = fx.max(m, fx.ptr_load(st + (hti * nkt + j) * HEAD_TILE + r16))
-            sv = svs[ht]
-            p = [valid[i].select(hw_exp2(sv[i] - m), fx.Float32(0.0)) for i in range(4)]
-            lw = (p[0] + p[2]) + (p[1] + p[3])
-            lw = lw + xshfl(lw, 32)
-            lw = lw + xshfl(lw, 16)
-            pw = (
-                fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-            )
-            pbase = (
-                sl["p"] + (hti * HEAD_TILE + r16) * p_row(d, s) + (kt * 16 + 4 * g) // 2
-            )
-            fx.ptr_store(fx.Vector.from_elements([pw[0], pw[1]], fx.Int32), pbase)
-            if g == 0:
-                fx.ptr_store(lw, lst + (hti * nkt + kt) * HEAD_TILE + r16)
+        if qkw:
+            for ht in range_constexpr(nht):
+                hti = hgi * nht + ht
+                m = fx.ptr_load(st + (hti * nkt) * HEAD_TILE + r16)
+                for j in range_constexpr(1, nkt):
+                    m = fx.max(m, fx.ptr_load(st + (hti * nkt + j) * HEAD_TILE + r16))
+                sv = svs[ht]
+                p = [
+                    valid[i].select(hw_exp2(sv[i] - m), fx.Float32(0.0))
+                    for i in range(4)
+                ]
+                lw = (p[0] + p[2]) + (p[1] + p[3])
+                lw = lw + xshfl(lw, 32)
+                lw = lw + xshfl(lw, 16)
+                pw = (
+                    fx.Vector.from_elements(p, fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)
+                )
+                pbase = (
+                    sl["p"]
+                    + (hti * HEAD_TILE + r16) * p_row(d, s)
+                    + (kt * 16 + 4 * g) // 2
+                )
+                fx.ptr_store(fx.Vector.from_elements([pw[0], pw[1]], fx.Int32), pbase)
+                if g == 0:
+                    fx.ptr_store(lw, lst + (hti * nkt + kt) * HEAD_TILE + r16)
         gpu.barrier()
         # chunk stats: (max, sum) per head
         if tid < d.heads:
@@ -468,22 +501,27 @@ def stage_combine(c, unit):
     ms, ls, vs = [], [], []
     for cc in range_constexpr(nchunk):
         live = cc < nlive
-        stv = fx.Vector(
-            bo.buffer_load(
-                rsrc(c["pstat"]),
-                ((t * nchunk + cc) * d.heads + h) * 2,
-                vec_width=2,
-                dtype=T.f32,
+        # chunks past the token's keys were never written this launch: their
+        # values are masked below, so skip the loads (a CTA-uniform branch)
+        stv = fx.Vector.filled(2, 0.0, fx.Float32)
+        pv = fx.Vector.filled(4, 0, fx.Int32)
+        if live:
+            stv = fx.Vector(
+                bo.buffer_load(
+                    rsrc(c["pstat"]),
+                    ((t * nchunk + cc) * d.heads + h) * 2,
+                    vec_width=2,
+                    dtype=T.f32,
+                )
             )
-        )
-        pv = fx.Vector(
-            bo.buffer_load(
-                rsrc(c["part"]),
-                (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
-                vec_width=4,
-                dtype=T.i32,
+            pv = fx.Vector(
+                bo.buffer_load(
+                    rsrc(c["part"]),
+                    (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
             )
-        )
         mc = live.select(stv[0], fx.Float32(NEG))
         ms.append(mc)
         ls.append(live.select(stv[1], fx.Float32(0.0)))
@@ -641,7 +679,7 @@ def back_lds_members(s: int, d: Dims) -> dict:
         q: fx.Array[fx.Int32, d.heads * Q_ROW, 16]
         raw: fx.Array[fx.Int32, ck * REC // 4, 16]
         p: fx.Array[fx.Int32, d.heads * p_row(d, s), 16]
-        st: fx.Array[fx.Float32, 2 * d.heads * (WAVES // head_groups(d, s)), 16]
+        st: fx.Array[fx.Float32, 2 * d.heads * key_tiles(d, s), 16]
 
     @fx.struct
     class GemvLds:

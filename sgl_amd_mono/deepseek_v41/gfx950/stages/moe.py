@@ -33,6 +33,7 @@ from sgl_amd_mono.common.ops import (
     bf_hi,
     bf_lo,
     butterfly,
+    clock,
     div_rn,
     fp8_pack4,
     fresh,
@@ -503,10 +504,10 @@ def _silu_mul(g, u):
 
 
 @flyc.jit
-def stage_shared(c, task, gops, t0, n):
-    """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID."""
+def stage_shared(c, task, gops, uops, t0, n):
+    """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID.
+    ``gops`` / ``uops``: the gate / up weight loads, both issued ahead of the input's wait."""
     tid, red, d = c["tid"], c["red"], c["d"]
-    a = c["args"]
     rows = None if isinstance(n, int) else n
     gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, gops, rows=rows)
     gpu.barrier()
@@ -514,9 +515,6 @@ def stage_shared(c, task, gops, t0, n):
     if tid < ROWS * n:
         gate = row_sum(red, tid % ROWS, tid // ROWS)
     gpu.barrier()
-    uops = gemv_fp8_loads(
-        c, a["sgu"], a["sgu_s"], HIDDEN, d.shared_tasks + task, row_major=True
-    )
     gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, uops, rows=rows)
     gpu.barrier()
     if tid < ROWS * n:
@@ -952,8 +950,10 @@ def stage_down(c, tasks):
     # slots of U a round: the loads of a round stay the same
     slots = DOWN_R_MAX // n
     per_round = WAVES * slots
-    # the shared expert's down projection first: its input is ready long before the routed results
-    down_shared(c, tasks)
+    # the routed rounds first: their ug flags settle while the shared expert's
+    # input (SMID) does; the shared projection (its weights already in flight)
+    # then runs ahead of the combine, which needs both
+    shops = down_shared_weights(c, tasks)
     for rnd in range(0, (nu + per_round - 1) // per_round, 1):
         # issue every load of the round's slots before the first wait (a slot past U reloads the last)
         us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
@@ -996,6 +996,7 @@ def stage_down(c, tasks):
                                 avs[j * slots + i],
                                 us[i] < nu,
                             )
+    down_shared(c, tasks, shops)
     gpu.barrier()
     for t0, nn in token_tiles(s):
         for j in range_constexpr(n):
@@ -1121,15 +1122,19 @@ def _down_ug_flag(c, ucs, f, per_slot):
     )
 
 
-@flyc.jit
-def down_shared(c, tasks):
-    """Run the shared expert's down projection of ``tasks``' rows for every token into LDS."""
-    s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
-    a = c["args"]
-    shops = [
+def down_shared_weights(c, tasks):
+    """Issue the shared expert's down weight loads of ``tasks``' rows."""
+    a, d = c["args"], c["d"]
+    return [
         gemv_fp8_loads(c, a["sw2"], a["sw2_s"], d.sh_inter, task, row_major=True)
         for task in tasks
     ]
+
+
+@flyc.jit
+def down_shared(c, tasks, shops):
+    """Run the shared expert's down projection of ``tasks``' rows for every token into LDS."""
+    s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
     for t0, nn in token_tiles(s):
         load_smid_tile(c, t0, nn, d.sh_inter // 32)
         for j in range_constexpr(len(tasks)):
@@ -1349,12 +1354,14 @@ def run_moe(c, key, bid, before_ug=None):
         await_x(c, [t])
         stage_xq(c, t)
         publish(c["put"], c["x8rdy"], t, 1, tid == 0)
+    tl_stamp(c, 26)
     multi = len(token_tiles(s)) > 1
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
         await_x(c, list(range(s)))
         stage_router(c, task)
     for t in range(first_task(bid, route0), s, BLOCKS):
         stage_route(c, t)
+    tl_stamp(c, 27)
     c["xl"], c["xsl"] = c["x8l"], c["x8sl"]
     # one shared unit a CTA at most: straight-line code, so LLVM does not hoist its loads
     assert c["rs"].shared_units <= BLOCKS
@@ -1365,14 +1372,18 @@ def run_moe(c, key, bid, before_ug=None):
         gops = gemv_fp8_loads(
             c, a["sgu"], a["sgu_s"], HIDDEN, unit % shared_tasks, row_major=True
         )
+        uops = gemv_fp8_loads(
+            c, a["sgu"], a["sgu_s"], HIDDEN, shared_tasks + unit % shared_tasks, row_major=True
+        )
         if const_expr(not multi):
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
-            stage_shared(c, unit, gops, 0, s)
+            stage_shared(c, unit, gops, uops, 0, s)
         else:
             t0 = unit // shared_tasks * TILE
             n = fx.min(fx.Int32(TILE), s - t0)
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
-            stage_shared(c, unit % shared_tasks, gops, t0, n)
+            stage_shared(c, unit % shared_tasks, gops, uops, t0, n)
+    tl_stamp(c, 28)
     if const_expr(before_ug is not None):
         before_ug()
     c["xl"], c["xsl"] = c["x8rl"], c["x8rsl"]
@@ -1385,19 +1396,29 @@ def run_moe(c, key, bid, before_ug=None):
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
-        # one token tile: every task placed (its x in LDS once a CTA)
+        # one token tile: every task placed (its x in LDS once a CTA). While the
+        # two-task CTAs stay within the shared units' count, a shared unit's CTA
+        # runs no ug task: its parts (the placement's last) would start only
+        # once the shared expert's gate/up GEMVs are done, and the down stage's
+        # last slots wait on them. Past that, the extra two-task CTAs cost more.
+        free = BLOCKS - c["rs"].shared_units
+        step = free if free < ug_tasks <= BLOCKS + c["rs"].shared_units else BLOCKS
+        limit = min(step, ug_tasks)
+        raw = first_task(bid, c["rs"].ug0)
         loaded = fx.Int32(0)
-        for task in range(first_task(bid, c["rs"].ug0), ug_tasks, BLOCKS):
+        for task in range((raw < limit).select(raw, fx.Int32(ug_tasks)), ug_tasks, step):
             if loaded == 0:
                 # X8R first: it is ready long before the routing
                 load_x8_rows(c, "x8r", "x8rs", c["x8rl"], c["x8rsl"], lambda j: j, s)
                 load_route(c, c["tab"])
             loaded = fx.Int32(1)
             stage_ug(c, task)
+    tl_stamp(c, 29)
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
     # load the route table unless an earlier stage of this CTA loaded it
-    if const_expr(not multi and ug_tasks <= BLOCKS):
-        load_route(c, c["tab"])
+    if const_expr(not multi):
+        if raw >= limit:
+            load_route(c, c["tab"])
     # every CTA its tile; the first CTAs here take the DOWN_TASKS - BLOCKS extra tiles
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
@@ -1405,13 +1426,28 @@ def run_moe(c, key, bid, before_ug=None):
         stage_down(c, [down_task, BLOCKS + rank])
     else:
         stage_down(c, [down_task])
+    tl_stamp(c, 30)
     for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
         stage_reduce(c, task)
+    tl_stamp(c, 31)
 
 
 def await_x(c, tokens):
     """Wait for the FFN seam's normed rows of ``tokens``."""
     c["poll"]([(c["xrdy"], t, 1) for t in tokens])
+
+
+@flyc.jit
+def tl_stamp(c, point):
+    """A timeline build's stage mark (``c["tl"]``: the table base, 32 words a CTA)."""
+    if const_expr(c.get("tl") is not None):
+        if c["tid"] == 0:
+            bo.buffer_store(
+                fx.Int32(clock()),
+                rsrc(c["tl"]),
+                c["bid"] * 32 + point,
+                cache_modifier=CM_DEV,
+            )
 
 
 def moe_args(*values) -> dict:

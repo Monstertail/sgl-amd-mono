@@ -277,6 +277,8 @@ class DSV41MonoRunner:
             dev = torch.device(dev.type, torch.cuda.current_device())
         self.device = dev
         self._scratch: dict[int, torch.Tensor] = {}
+        # K2_TL: build K2 as a timeline build (stage marks past the scratch layout)
+        self._tl = bool(int(os.environ.get("K2_TL", "0")))
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -342,7 +344,8 @@ class DSV41MonoRunner:
         if buf is None:
             no_capture(f"step width {tokens}")
             buf = torch.zeros(
-                scratch_bytes(tokens, self.tp, **self.route),
+                scratch_bytes(tokens, self.tp, **self.route)
+                + (BLOCKS * 32 * 4 if self._tl else 0),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -415,6 +418,7 @@ class DSV41MonoRunner:
                     kt=True,
                     index=index,
                     compressed=compressed,
+                    timeline=self._tl,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                     **self.route,

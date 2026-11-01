@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Device primitives of K1's attention front, adapted from ATOM's mono decode framework."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr
@@ -9,7 +10,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sgl_amd_mono.common.ops import bf16_pair, rsrc
+from sgl_amd_mono.common.ops import bf16_pair, clock, rsrc
 from sgl_amd_mono.common.sync import _spin
 
 # The execution model: one CTA a CU of an MI355X, all resident.
@@ -197,6 +198,15 @@ def fp8x8_bf16(w0, w1, scale):
     return fx.Vector.from_elements(out, fx.Int32)
 
 
+@flyc.jit
 def stamp(c, point):
-    """The attention back's stage marks; this build records no timeline."""
-    return
+    """This CTA's stage mark of a timeline build (``c["tl"]``: the table base,
+    32 words a CTA): the 100 MHz clock at ``point``; any other build's no-op."""
+    if const_expr(c.get("tl") is not None):
+        if c["tid"] == 0:
+            bo.buffer_store(
+                fx.Int32(clock()),
+                rsrc(c["tl"]),
+                c["bid"] * 32 + point,
+                cache_modifier=CM_DEV,
+            )
