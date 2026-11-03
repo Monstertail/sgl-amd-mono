@@ -72,6 +72,7 @@ from .plan import (
     cdiv,
     tile_rows,
     token_tiles,
+    split64,
 )
 
 _STREAM = fx.Stream(None)
@@ -101,7 +102,7 @@ def head_groups(d: Dims, s: int) -> int:
     """Wave groups a split unit's head tiles are spread over: two (a tile each,
     64-key chunks, twice the units) while the units fit the grid, else one (a
     wave's keys loaded and dequantized once for every head tile)."""
-    return 2 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= BLOCKS else 1
+    return 2 if split64(d, s) else 1
 
 
 def chunk_keys(d: Dims, s: int) -> int:
@@ -212,9 +213,13 @@ def stage_split(c, unit):
     ck = chunk_keys(d, s)
     ngrp = head_groups(d, s)
     nkt = WAVES // ngrp  # 16-key tiles a chunk
-    nht = d.head_tiles // ngrp  # head tiles a wave
+    nht = cdiv(d.head_tiles, ngrp)  # head tiles a head group at most
     hgi = wave // nkt
     kt = wave % nkt
+    # a head group past the rank's head tiles (TP4's one tile over two groups)
+    # has no QK: it skips the key loads, the QK and the softmax but still runs
+    # the PV over the keys group 0 stored
+    hds = True if ngrp * nht == d.head_tiles else hgi * nht < d.head_tiles
     g = lane // 16
     r16 = lane % 16
     k0 = ch * ck
@@ -243,15 +248,19 @@ def stage_split(c, unit):
     data, sc, okv = key_rec(c, t, key)
     if k0 < kv_len:
         # lane g's 16 B slices: e4m3 dims 64 c + 16 g .., bf16 rope dims 32 c + 8 g ..
-        scw = global_load(sc, words=2)
-        nope = [
-            global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
-            for c4 in range(NOPE // 64)
-        ]
-        rope = [
-            global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
-            for cc in range(ROPE // 32)
-        ]
+        scw = fx.Vector.filled(2, 0, fx.Int32)
+        nope = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(NOPE // 64)]
+        rope = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(ROPE // 32)]
+        if hds:
+            scw = global_load(sc, words=2)
+            nope = [
+                global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
+                for c4 in range(NOPE // 64)
+            ]
+            rope = [
+                global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
+                for cc in range(ROPE // 32)
+            ]
         for i in range_constexpr(cdiv(qrow, THREADS)):
             u = fresh(tid) + THREADS * i
             if u < qrow:
@@ -288,64 +297,69 @@ def stage_split(c, unit):
         scale = a["qk_scale"].bitcast(fx.Float32)
         st = sl["st"]
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nht)]
-        for c4 in range_constexpr(NOPE // 64):
-            ksc = pow2(_scale_byte(scw, c4))
-            for h2 in range_constexpr(2):
-                kw = fp8x8_bf16(nope[c4][2 * h2], nope[c4][2 * h2 + 1], ksc).bitcast(
-                    fx.BFloat16
-                )
+        if hds:
+            for c4 in range_constexpr(NOPE // 64):
+                ksc = pow2(_scale_byte(scw, c4))
+                for h2 in range_constexpr(2):
+                    kw = fp8x8_bf16(nope[c4][2 * h2], nope[c4][2 * h2 + 1], ksc).bitcast(
+                        fx.BFloat16
+                    )
+                    for ht in range_constexpr(nht):
+                        qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
+                        qw = fx.ptr_load(
+                            qb + 32 * c4 + 8 * g + 4 * h2,
+                            result_type=fx.Vector.make_type(4, fx.Int32),
+                        )
+                        accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
+            for cc in range_constexpr(ROPE // 32):
+                kw = rope[cc].bitcast(fx.BFloat16)
                 for ht in range_constexpr(nht):
                     qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
                     qw = fx.ptr_load(
-                        qb + 32 * c4 + 8 * g + 4 * h2,
+                        qb + (NOPE + cc * 32 + 8 * g) // 2,
                         result_type=fx.Vector.make_type(4, fx.Int32),
                     )
                     accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
-        for cc in range_constexpr(ROPE // 32):
-            kw = rope[cc].bitcast(fx.BFloat16)
+            # scores of keys 4 g + i (C rows), head r16 of a tile (C column)
+            ok = (key < kv_len) & okv
+            okw = ok.select(fx.Int32(1), fx.Int32(0))
+            valid = [lane_gather(okw, 4 * g + i) != 0 for i in range(4)]
             for ht in range_constexpr(nht):
-                qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
-                qw = fx.ptr_load(
-                    qb + (NOPE + cc * 32 + 8 * g) // 2,
-                    result_type=fx.Vector.make_type(4, fx.Int32),
+                sv = [
+                    valid[i].select(accs[ht][i] * scale, fx.Float32(NEG)) for i in range(4)
+                ]
+                mw = butterfly(
+                    fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])), (32, 16), fx.max
                 )
-                accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
-        # scores of keys 4 g + i (C rows), head r16 of a tile (C column)
-        ok = (key < kv_len) & okv
-        okw = ok.select(fx.Int32(1), fx.Int32(0))
-        valid = [lane_gather(okw, 4 * g + i) != 0 for i in range(4)]
-        svs = []
-        for ht in range_constexpr(nht):
-            sv = [
-                valid[i].select(accs[ht][i] * scale, fx.Float32(NEG)) for i in range(4)
-            ]
-            mw = butterfly(
-                fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])), (32, 16), fx.max
-            )
-            if g == 0:
-                fx.ptr_store(mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16)
-            svs.append(sv)
+                if g == 0:
+                    fx.ptr_store(mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16)
         gpu.barrier()
         lst = st + d.tile_heads * nkt
-        for ht in range_constexpr(nht):
-            hti = hgi * nht + ht
-            m = fx.ptr_load(st + (hti * nkt) * HEAD_TILE + r16)
-            for j in range_constexpr(1, nkt):
-                m = fx.max(m, fx.ptr_load(st + (hti * nkt + j) * HEAD_TILE + r16))
-            sv = svs[ht]
-            p = [valid[i].select(hw_exp2(sv[i] - m), fx.Float32(0.0)) for i in range(4)]
-            lw = (p[0] + p[2]) + (p[1] + p[3])
-            lw = lw + xshfl(lw, 32)
-            lw = lw + xshfl(lw, 16)
-            pw = (
-                fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-            )
-            pbase = (
-                sl["p"] + (hti * HEAD_TILE + r16) * p_row(d, s) + (kt * 16 + 4 * g) // 2
-            )
-            fx.ptr_store(fx.Vector.from_elements([pw[0], pw[1]], fx.Int32), pbase)
-            if g == 0:
-                fx.ptr_store(lw, lst + (hti * nkt + kt) * HEAD_TILE + r16)
+        if hds:
+            ok = (key < kv_len) & okv
+            okw = ok.select(fx.Int32(1), fx.Int32(0))
+            valid = [lane_gather(okw, 4 * g + i) != 0 for i in range(4)]
+            for ht in range_constexpr(nht):
+                hti = hgi * nht + ht
+                m = fx.ptr_load(st + (hti * nkt) * HEAD_TILE + r16)
+                for j in range_constexpr(1, nkt):
+                    m = fx.max(m, fx.ptr_load(st + (hti * nkt + j) * HEAD_TILE + r16))
+                sv = [
+                    valid[i].select(accs[ht][i] * scale, fx.Float32(NEG)) for i in range(4)
+                ]
+                p = [valid[i].select(hw_exp2(sv[i] - m), fx.Float32(0.0)) for i in range(4)]
+                lw = (p[0] + p[2]) + (p[1] + p[3])
+                lw = lw + xshfl(lw, 32)
+                lw = lw + xshfl(lw, 16)
+                pw = (
+                    fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+                )
+                pbase = (
+                    sl["p"] + (hti * HEAD_TILE + r16) * p_row(d, s) + (kt * 16 + 4 * g) // 2
+                )
+                fx.ptr_store(fx.Vector.from_elements([pw[0], pw[1]], fx.Int32), pbase)
+                if g == 0:
+                    fx.ptr_store(lw, lst + (hti * nkt + kt) * HEAD_TILE + r16)
         gpu.barrier()
         if tid < d.heads:
             hts = tid // HEAD_TILE
@@ -510,10 +524,12 @@ def stage_combine(c, unit):
     ms, ls, vs = [], [], []
     for cc in range_constexpr(nchunk):
         live = cc < nlive
+        # a chunk past the token's keys was never written: reread a live one
+        cl = fx.max(fx.min(fx.Int32(cc), nlive - 1), fx.Int32(0))
         stv = fx.Vector(
             bo.buffer_load(
                 rsrc(c["pstat"]),
-                ((t * nchunk + cc) * d.heads + h) * 2,
+                ((t * nchunk + cl) * d.heads + h) * 2,
                 vec_width=2,
                 dtype=T.f32,
             )
@@ -521,7 +537,7 @@ def stage_combine(c, unit):
         pv = fx.Vector(
             bo.buffer_load(
                 rsrc(c["part"]),
-                (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
+                (((t * nchunk + cl) * d.heads + h) * HEAD_DIM + d0) // 2,
                 vec_width=4,
                 dtype=T.i32,
             )

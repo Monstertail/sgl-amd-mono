@@ -145,10 +145,22 @@ def front_scratch(s: int, d: Dims) -> dict:
     )
 
 
+def split64(d: Dims, s: int) -> bool:
+    """64-key split chunks (two head groups, twice the split units) while the
+    units fit the grid. Two head tiles (TP2): a tile a group. One head tile at
+    TP4, up to 4 rows: the tile-less group's waves skip the key loads, the QK
+    and the softmax but still run the PV."""
+    if s * cdiv(KEYS, 64) > 256:
+        return False
+    if d.head_tiles == 2:
+        return True
+    return d.head_tiles == 1 and d.tile_heads == d.heads and s <= 4
+
+
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
     # must match back.chunk_keys
-    ck = 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+    ck = 64 if split64(d, s) else 128
     nchunk = cdiv(KEYS, ck)
     return byte_layout(
         [
