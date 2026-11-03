@@ -164,11 +164,19 @@ def _compile_flags(npes: int) -> None:
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.ops import load_ptr64
-    from sgl_amd_mono.common.plan import THREADS
+    from sgl_amd_mono.common.plan import THREADS, kernel_sources
     from sgl_amd_mono.common.sync import Mailbox, sreg
+
+    # The flag load this test exists to compile lives in sgl_amd_mono/common,
+    # a different directory from this file, and FlyDSL keys a kernel on its own
+    # source and its same-directory helpers only. Without the digest, editing
+    # Guard.flags changes neither the name nor the key, and a warm cache serves
+    # the old binary. _build above does the same.
+    keyed = (npes, kernel_sources(guard.__name__))
 
     @flyc.kernel(name=f"mono_guard_flags_n{npes}", known_block_size=[THREADS, 1, 1])
     def k(epoch: Int64, box: Int64, peers: Int64):
+        _ = keyed
         own = load_ptr64(peers, fx.Int32(0))
         with guard.scope(
             guard.Guard(epoch, own=own, peers=peers, rank=fx.Int32(0), npes=npes)
@@ -180,6 +188,7 @@ def _compile_flags(npes: int) -> None:
 
     @flyc.jit
     def launch(epoch: Int64, box: Int64, peers: Int64, stream):
+        _ = keyed
         k(epoch, box, peers).launch(grid=(1,), block=(THREADS,), stream=stream)
 
     dev = torch.cuda.current_device()
@@ -193,10 +202,11 @@ def test_the_peer_flags_compile_at_every_tp_size(npes):
     """TP 8 is the width ``FLAG_WORDS`` allows, and a single system-scope load
     that wide has no instruction on gfx950, so the read is split.
 
-    Two things about this test. It fails by aborting the process, not by
-    failing an assertion, because LLVM aborts when it cannot select a pattern.
-    And it only compiles on a cold FlyDSL cache. A binary left by an earlier
-    run of the same kernel name is loaded without compiling, and then the test
-    passes whatever the source says.
+    This test fails by aborting the process, not by failing an assertion,
+    because LLVM aborts when it cannot select a pattern.
+
+    It compiles again whenever guard.py changes, because _compile_flags keys
+    the kernel on that module's digest. A run that changes nothing else loads
+    the earlier binary, which is the result this test asserts anyway.
     """
     _compile_flags(npes)
