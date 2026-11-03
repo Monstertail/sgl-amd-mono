@@ -22,6 +22,7 @@ TOKEN_PAR_FROM = 12
 QX_WORDS = Q_RANK // 4  # the q latent's e4m3 words
 QX_GROUPS = Q_RANK // 32
 KG_WORDS = DATA // 4 + 2  # a window record's data words, then its two scale words
+LINE = 128  # every peer region starts on a cache line
 
 # a row's bytes in each per-row seam argument (``own_view``)
 ROW_BYTES = {
@@ -36,6 +37,17 @@ ROW_BYTES = {
     "pre_out": HC * 4,
     "comb_out": HC * HC * 4,
 }
+
+
+def half_pair(n: int, chunk, h: int):
+    """Where half ``h`` of a lane's 4-pair chunk goes in a gathered row of ``n`` pairs,
+    so each wave store fills whole lines."""
+    return h * (n // 2) + 2 * chunk
+
+
+def chunk_pairs(n: int, q):
+    """The first logical pair at a gathered row's 2-pair group ``q`` (inverts ``half_pair``)."""
+    return 4 * (q % (n // 4)) + 2 * (q // (n // 4))
 
 
 def token_par(s: int, tp: int) -> bool:
@@ -62,7 +74,8 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
             ("nbg", row),
             ("qrg", s * Q_RANK // 2),
             ("iwg", s * 16),
-        ]
+        ],
+        align=LINE,
     )
 
 

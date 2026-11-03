@@ -136,6 +136,8 @@ SGLANG_READS = {
         "fp8_gemm_runner_backend",
         "context_length",
         "expert_distribution_recorder_mode",
+        "disaggregation_mode",
+        "disaggregation_transfer_backend",
     ),
     "srt/environ.py": (
         "SGLANG_DSV4_FP4_EXPERTS",
@@ -228,11 +230,14 @@ SGLANG_READS = {
         "get_attn_backend",
         "get_token_to_kv_pool",
     ),
-    "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
     "srt/layers/engram.py": (
         "layer_hash_index",
         "forward(cp_all_tokens)",
+        "Engram.forward(input_ids)",
+        "image_token_id",
         "engram_gate",
+        "engram_gate(input_ids)",
+        "engram_gate(image_token_id)",
         "embed",
         "wkv",
         "q_weight",
@@ -365,12 +370,18 @@ def _covered_layers(config) -> list[int]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    """What ``SPEC.requires`` cannot state: a value SGLang's attention gate must not
-    take, aiter's own flag, and FlyDSL."""
+    """What ``SPEC.requires`` cannot state: PD roles other than a MoRI decode server, a
+    value SGLang's attention gate must not take, aiter's own flag, and FlyDSL."""
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.utils import get_bool_env_var
 
     reasons = []
+    mode = cfg.disaggregation_mode
+    if mode not in (None, "null"):
+        if mode != "decode":
+            reasons.append("PD monokernels support the decode role only")
+        elif cfg.disaggregation_transfer_backend != "mori":
+            reasons.append("PD monokernels require the mori transfer backend")
     if is_unified_kv_triton():
         reasons.append("needs the paged SWA cache, not unified_kv")
     if get_bool_env_var("AITER_FORCE_A8W4"):
@@ -978,10 +989,6 @@ class _Built:
             engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
-        # image rows bypass Engram on every step, as in SGLang: a graph cannot branch on mm inputs
-        image = None
-        if m.config.vision_n_layers > 0:
-            image = (input_ids == m.config.image_token_id)[:, None, None]
         pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
         plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
         for i in range(m.start_layer, m.end_layer):
@@ -991,12 +998,17 @@ class _Built:
                 rows = engram_rows.get(engram.layer_hash_index)
                 if rows is None:
                     residual = engram(
-                        before, hash_ids[:, engram.layer_hash_index], forward_batch
+                        before,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        input_ids=input_ids,
                     )
                 else:  # Engram.forward on the staged rows
                     from sglang.srt.layers.engram import engram_gate
 
                     kv, _ = engram.wkv(rows.flatten(-2))
+                    # image rows keep their residual in the gate, as in SGLang
+                    image_ids = input_ids if engram.image_token_id is not None else None
                     residual = engram_gate(
                         before,
                         kv,
@@ -1004,9 +1016,9 @@ class _Built:
                         engram.k_weight,
                         engram.eps,
                         engram.clamp_value,
+                        input_ids=image_ids,
+                        image_token_id=engram.image_token_id,
                     )
-                if image is not None:
-                    residual = torch.where(image, before, residual)
                 pending = (None, residual, None, None)
             # an Engram layer reads the settled residual: no post owed into it
             defer = i + 1 < m.end_layer and m.layers[i + 1].engram is None
@@ -1205,7 +1217,8 @@ SPEC = MonoSpec(
             resident_blocks=BLOCKS,
         )
     },
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # MoRI transfers into the same KV, compressor-state and index-key buffers the kernels use
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.PD_DISAGGREGATION}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsv4"}),
