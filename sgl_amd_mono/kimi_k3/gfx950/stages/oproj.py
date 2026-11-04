@@ -290,6 +290,7 @@ def build(key: AttnPostBuild):
                 "core": core,
                 "w_o": w_o,
                 "prefix": prefix,
+                "prefix_out": prefix,
                 "blocks": blocks,
                 "blk_sm": blk_sm,
                 "blk_sr": blk_sr,

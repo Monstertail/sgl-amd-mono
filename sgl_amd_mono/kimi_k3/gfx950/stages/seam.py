@@ -66,8 +66,9 @@ def sum_polled(vals):
 @flyc.jit
 def stage_slice(c, task):
     """Columns 128 task ..: every token's sources into LDS ``vals`` (4 columns a
-    thread), the prefix (+ delta) rounded to bf16 and stored back, per-(token,
-    source) partial sum of squares and qk dot -> PART."""
+    thread), the prefix (+ delta) rounded to bf16 and stored to ``prefix_out``
+    (the input prefix, when the two are one buffer), per-(token, source)
+    partial sum of squares and qk dot -> PART."""
     s, ns, nb, tid, lane = c["S"], c["NS"], c["NB"], c["tid"], c["lane"]
     a = c["args"]
     c0 = task * COLS
@@ -101,7 +102,7 @@ def stage_slice(c, task):
                 pre = [bf16r(pre[j] + dl[j]) for j in range(4)]
             if live & is_pre:
                 bo.buffer_store(
-                    bf4_words(pre), rsrc(a["prefix"]), (t * HIDDEN + col) // 2
+                    bf4_words(pre), rsrc(a["prefix_out"]), (t * HIDDEN + col) // 2
                 )
         if const_expr(c.get("write_idx", -1) >= 0):  # noqa: SIM102 (traced: `and` does not combine traced values)
             # the block-write layer's attention seam: the updated prefix is

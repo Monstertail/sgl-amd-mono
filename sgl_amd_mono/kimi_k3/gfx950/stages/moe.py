@@ -52,6 +52,7 @@ from sgl_amd_mono.common.mx import (
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     ballot,
+    bf16_pair,
     bf16_round,
     bf_hi,
     bf_lo,
@@ -1108,8 +1109,19 @@ def stage_up(c, j):
 
 @flyc.jit
 def stage_reduce(c, j):
-    """Columns 128 j ..: FINAL in rank order -> bf16 out."""
+    """Columns 128 j ..: FINAL in rank order -> bf16 out.
+
+    ``fold``: the updated prefix added in too, so the launch's output is the
+    layer's (the host's ``out + prefix``). The add rounds to bf16 first and
+    again after, the host add's exact rounding; the prefix reaches these CTAs
+    through the same device-scope hand-off chain as every other plain value
+    the launch passes between stages, so a CM_DEV load reads it here.
+    """
     s, tid = c["S"], c["tid"]
+    # Hoisted out of the branch below: a ``c.`` call inside a dynamic ``if``
+    # makes the rewriter carry ``c`` (which holds the Mailbox's methods) as
+    # branch state, and that cannot lower to IR.
+    fold = c.get("fold", False)
     if tid < s * 64:
         t = tid // 64
         cp = tid % 64
@@ -1125,6 +1137,19 @@ def stage_reduce(c, j):
             .to(fx.BFloat16)
             .bitcast(fx.Int32)[0]
         )
+        if const_expr(fold):
+            pr = fx.Int32(
+                bo.buffer_load(
+                    rsrc(c["args"]["prefix_out"]),
+                    (t * HIDDEN + col) // 2,
+                    vec_width=1,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            o0, o1 = bf_lo(w), bf_hi(w)
+            p0, p1 = bf_lo(pr), bf_hi(pr)
+            w = bf16_pair(bf16_round(o0 + p0), bf16_round(o1 + p1)).bitcast(fx.Int32)
         bo.buffer_store(w, rsrc(c["args"]["out"]), (t * HIDDEN + col) // 2)
     gpu.barrier()
 

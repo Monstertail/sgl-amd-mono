@@ -86,6 +86,7 @@ class K2Build(msgspec.Struct, frozen=True):
     ln_eps: float = 1e-5  # the latent RMSNorm
     reduce: bool = True  # the final reduce here (else the next layer's K1)
     reset: bool = False  # a block-write layer: the prefix restarts at the o_proj output
+    fold: bool = False  # the reduce adds the updated prefix: out is the layer's
     timeline: bool = False
     # fault injection (tests only): the wait to stall and how many launches
     # to let through first. Compile-time, so a serving build pays nothing.
@@ -206,7 +207,7 @@ def build(key: K2Build):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_k2_s{s}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
-        f"_t{int(key.timeline)}"
+        f"_f{int(key.fold)}_t{int(key.timeline)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -214,6 +215,7 @@ def build(key: K2Build):
         core: Int64,
         w_o: Int64,
         prefix: Int64,
+        prefix_out: Int64,
         blocks: Int64,
         blk_sm: Int32,
         blk_sr: Int32,
@@ -293,6 +295,7 @@ def build(key: K2Build):
                 "rank": rank,
                 "delta": True,
                 "reset": key.reset,
+                "fold": key.fold,
                 "gate_local": False,
                 "debug": False,
                 "eps": key.eps,
@@ -335,6 +338,7 @@ def build(key: K2Build):
                     "core": core,
                     "w_o": w_o,
                     "prefix": prefix,
+                    "prefix_out": prefix_out,
                     "blocks": blocks,
                     "blk_sm": blk_sm,
                     "blk_sr": blk_sr,
@@ -462,6 +466,7 @@ def build(key: K2Build):
         core: Int64,
         w_o: Int64,
         prefix: Int64,
+        prefix_out: Int64,
         blocks: Int64,
         blk_sm: Int32,
         blk_sr: Int32,
@@ -493,6 +498,7 @@ def build(key: K2Build):
             core,
             w_o,
             prefix,
+            prefix_out,
             blocks,
             blk_sm,
             blk_sr,
@@ -536,6 +542,7 @@ def k2_launch(
     core,
     w_o,
     prefix,
+    prefix_out=None,
     blocks,
     ares_nw,
     ares_qk,
@@ -559,19 +566,24 @@ def k2_launch(
     layer,
     tl=None,
 ):
-    """Host launcher: ``core`` [S, 1536] (o_proj's input), ``prefix`` updated in
-    place, ``out`` the MoE output [S, 7168]; MoE weights as ``moe``."""
+    """Host launcher: ``core`` [S, 1536] (o_proj's input), the updated prefix
+    written to ``prefix_out`` (``prefix`` itself when not given, updated in
+    place), ``out`` the MoE output [S, 7168] -- with ``fold``, the updated
+    prefix already added in, the layer's output; MoE weights as ``moe``."""
     assert (
         w_o.shape == (HIDDEN, k2a.OK)
         and core.is_contiguous()
         and prefix.is_contiguous()
     )
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
+    prefix_out = prefix if prefix_out is None else prefix_out
+    assert prefix_out.is_contiguous()
     f = build(key)
     f(
         core.data_ptr(),
         w_o.data_ptr(),
         prefix.data_ptr(),
+        prefix_out.data_ptr(),
         blocks.data_ptr(),
         blocks.stride(0),
         blocks.stride(1),

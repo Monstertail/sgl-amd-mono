@@ -464,6 +464,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
             out_eps=layer.post_attention_layernorm.variance_epsilon,
             ln_eps=moe.routed_expert_norm.variance_epsilon,
             reset=layer.is_block_write_layer,
+            fold=True,
             guint=_gu_interleaved(moe),
             fault_site=runner.fault_site,
             fault_after=runner.fault_after,
@@ -497,7 +498,7 @@ def _up_shard(moe, rank: int):
     return moe.routed_expert_up_proj.weight.narrow(0, rank * UP_N, UP_N)
 
 
-def _k2_launch(runner, packed: _Layer, core, prefix, blocks, out) -> None:
+def _k2_launch(runner, packed: _Layer, core, prefix, blocks, out, prefix_out=None) -> None:
     """The launch itself: this layer's weights read in place, the activations
     the caller owns."""
     from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
@@ -510,6 +511,7 @@ def _k2_launch(runner, packed: _Layer, core, prefix, blocks, out) -> None:
         core=core,
         w_o=module.self_attn.o_proj.weight,
         prefix=prefix,
+        prefix_out=prefix_out,
         blocks=blocks,
         ares_nw=module.mlp_res_norm.weight,
         ares_qk=module.mlp_res_proj.weight.view(HIDDEN),
@@ -539,19 +541,26 @@ def _launch(runner, packed: _Layer, attn_res, core, forward_batch):
     module = packed.module
     rows = core.shape[0]
     core = core.contiguous()
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
     # A block-write layer restarts the prefix, so it takes none.
     prefix_sum = (
         None if module.is_block_write_layer else written_residual(forward_batch)
     )
     _check(packed, core, prefix_sum, attn_res, rows)
-    prefix = runner.prefix[:rows]
-    if prefix_sum is not None:
-        # Not ``prefix = prefix_sum``: that tensor is the residual stream's,
-        # lent out read-only, and the kernel updates its prefix in place.
-        prefix.copy_(prefix_sum)
-    out = torch.empty_like(prefix)
-    _k2_launch(runner, packed, core, prefix, attn_res.block_residual, out)
-    return out + prefix
+    prefix_out = runner.prefix[:rows]
+    # The launch reads the residual stream as its input prefix (that tensor is
+    # lent out read-only, which the launch honors: it writes the updated prefix
+    # to ``prefix_out``) and folds the updated prefix into ``out`` -- so no
+    # staging copy and no residual add on the host. A block-write layer reads
+    # no input prefix: hand it the scratch buffer (its seam overwrites it).
+    prefix = prefix_sum if prefix_sum is not None else prefix_out
+    out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=core.device)
+    _k2_launch(
+        runner, packed, core, prefix, attn_res.block_residual, out,
+        prefix_out=prefix_out,
+    )
+    return out
 
 
 def _check(packed: _Layer, core, prefix_sum, attn_res, rows: int) -> None:

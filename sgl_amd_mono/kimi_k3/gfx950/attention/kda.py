@@ -630,6 +630,7 @@ def build(key: KdaPreBuild):
             "xbuf": scratch + fx.Int64(lay["x"][0]),
             "args": {
                 "prefix": prefix,
+                "prefix_out": prefix,
                 "delta": delta,
                 "blocks": blocks,
                 "blk_sm": blk_sm,
