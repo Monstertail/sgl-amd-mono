@@ -253,7 +253,7 @@ def put_mxfp8_group_vllm(c, words_mb, codes_mb, t, g, v, amax):
 
 
 # ---------------------------------------------------------------- router
-ROUTER_EARLY_FROM = 12  # rows from which the router loads its gate rows early
+ROUTER_EARLY_FROM = 1  # rows from which the router loads its gate rows early
 
 
 def router_weights(c, task):
@@ -508,8 +508,12 @@ def _silu_mul(g, u):
 
 
 @flyc.jit
-def stage_shared(c, task, gops, t0, n):
-    """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID."""
+def stage_shared(c, task, gops, uops, t0, n):
+    """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID.
+
+    ``uops``: the up rows' loads where issued with the gate's (narrow steps, ``SHARED_UP_EARLY``);
+    None: load them here, the gate rows' MFMAs done (wide steps are HBM-bound: the up rows'
+    early loads would steal the ug stage's bandwidth)."""
     tid, red, d = c["tid"], c["red"], c["d"]
     a = c["args"]
     rows = None if isinstance(n, int) else n
@@ -519,9 +523,10 @@ def stage_shared(c, task, gops, t0, n):
     if tid < ROWS * n:
         gate = row_sum(red, tid % ROWS, tid // ROWS)
     gpu.barrier()
-    uops = gemv_fp8_loads(
-        c, a["sgu"], a["sgu_s"], HIDDEN, d.shared_tasks + task, row_major=True
-    )
+    if const_expr(uops is None):
+        uops = gemv_fp8_loads(
+            c, a["sgu"], a["sgu_s"], HIDDEN, d.shared_tasks + task, row_major=True
+        )
     gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, uops, rows=rows)
     gpu.barrier()
     if tid < ROWS * n:
@@ -573,8 +578,9 @@ def gemv_fp4_pair(c, w, ws, e, n_rows, k, rg0, ks, xl, xsl, scale_cols, col):
     rounds = ug_rounds(k, ks, slices)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     # rounds whose loads are in flight past the one computing; TP8's ug tasks outnumber
-    # the CTAs, so the CTAs that run two stream each at what loads they keep in flight
-    ahead = slices if c["d"].tp >= 8 else slices // 2
+    # the CTAs, so the CTAs that run two stream each at what loads they keep in flight.
+    # A fine task's four rounds (K quarters) all fit: keep every load in flight.
+    ahead = slices if c["d"].tp >= 8 or slices == 4 else slices // 2
     ops = [
         fp4_pair_loads(c, w, ws, e, n_rows, k, rg0, scale_cols, *rounds[q])
         for q in range(min(ahead, len(rounds)))
@@ -1392,6 +1398,12 @@ def ug_free(key, rs) -> int:
     return BLOCKS if key.ug_all else BLOCKS - rs.shared_units
 
 
+# up to this many tokens the shared expert's up rows load with its gate rows
+# (bandwidth is spare); wider, they load as the gate's MFMAs end (the ug stage's
+# weight flood would stall behind them)
+SHARED_UP_EARLY = 4
+
+
 @flyc.jit
 def run_moe(c, key, bid, before_ug=None):
     """The MoE stages, in order (``before_ug``: work for this CTA once its shared
@@ -1408,7 +1420,8 @@ def run_moe(c, key, bid, before_ug=None):
     stamp(c, 19)
     multi = len(token_tiles(s)) > 1
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
-        # wide, the gate rows go out before x's wait (narrower it is slower: ROCm/ATOM)
+        # the gate rows do not depend on the awaited rows: their loads go out
+        # before x's wait at every supported width (ROUTER_EARLY_FROM 1)
         wvs = router_weights(c, task) if const_expr(s >= ROUTER_EARLY_FROM) else None
         await_x(c, list(range(s)))
         stage_router(c, task, wvs)
@@ -1421,19 +1434,26 @@ def run_moe(c, key, bid, before_ug=None):
     assert c["rs"].shared_units <= BLOCKS
     unit = first_task(bid, shared0)
     if unit < c["rs"].shared_units:
-        # the gate weights in flight before x's wait
+        # the gate weights in flight before x's wait (the up rows' too, narrow)
         a = c["args"]
         gops = gemv_fp8_loads(
             c, a["sgu"], a["sgu_s"], HIDDEN, unit % shared_tasks, row_major=True
         )
+        uops = (
+            gemv_fp8_loads(
+                c, a["sgu"], a["sgu_s"], HIDDEN, shared_tasks + unit % shared_tasks, row_major=True
+            )
+            if const_expr(s <= SHARED_UP_EARLY)
+            else None
+        )
         if const_expr(not multi):
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
-            stage_shared(c, unit, gops, 0, s)
+            stage_shared(c, unit, gops, uops, 0, s)
         else:
             t0 = unit // shared_tasks * TILE
             n = fx.min(fx.Int32(TILE), s - t0)
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
-            stage_shared(c, unit % shared_tasks, gops, t0, n)
+            stage_shared(c, unit % shared_tasks, gops, uops, t0, n)
     stamp(c, 22)
     if const_expr(before_ug is not None):
         before_ug()

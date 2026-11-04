@@ -148,13 +148,13 @@ def front_scratch(s: int, d: Dims) -> dict:
 def split64(d: Dims, s: int) -> bool:
     """64-key split chunks (two head groups, twice the split units) while the
     units fit the grid. Two head tiles (TP2): a tile a group. One head tile at
-    TP4, up to 4 rows: the tile-less group's waves skip the key loads, the QK
+    TP4, up to 8 rows: the tile-less group's waves skip the key loads, the QK
     and the softmax but still run the PV."""
     if s * cdiv(KEYS, 64) > 256:
         return False
     if d.head_tiles == 2:
         return True
-    return d.head_tiles == 1 and d.tile_heads == d.heads and s <= 4
+    return d.head_tiles == 1 and d.tile_heads == d.heads and s <= 8
 
 
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
