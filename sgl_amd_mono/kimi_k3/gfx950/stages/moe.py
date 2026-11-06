@@ -170,7 +170,7 @@ W13_K = LAT  # 3584
 W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
 DOWN_TASKS = LAT // ROWS  # 224
-DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
+DOWN_BATCH = 4  # a wave's experts whose w2 is in flight together
 MAX_U = 8 * TOPK
 TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
 
@@ -1336,6 +1336,52 @@ def down_loads(c, rgd, nu, b0):
 
 
 @flyc.jit
+def down_batch(c, nu, ops, b0):
+    s, lane = c["S"], c["lane"]
+    rt = c["rt"]
+    t = fx.min(lane % 16, s - 1)
+    kb = lane // 16
+    nbs = DOWN_BATCH * W2_STEPS
+    slots = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
+    for j in range_constexpr(DOWN_BATCH):
+        live = (b0 + WAVES * j) < nu
+        k = fx.ptr_load(rt["kof"] + (slots[j] * 8 + t))
+        picked = (k >= 0) & (lane % 16 < s)
+        pick = t * TOPK + fx.max(k, 0)
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for st in range_constexpr(W2_STEPS):
+            bw = fx.Vector(
+                fx.ptr_load(
+                    c["interq"] + (pick * 48 + st * 16 + kb * 4),
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
+            acc = mfma_scaled(
+                ops[j * W2_STEPS + st],
+                bw,
+                acc,
+                ops[nbs + j * W2_STEPS + st],
+                scode,
+                FP4,
+                FP4,
+                0,
+                0,
+            )
+        if live & picked:
+            wt = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(
+                fx.Float32
+            )
+            values = fx.Vector.from_elements(
+                [bf16_round(acc[i] * wt) for i in range(4)], fx.Float32
+            )
+            fx.ptr_store(
+                values,
+                c["contrib"] + ((t * TOPK + k) * ROWS + 4 * (lane // 16)),
+            )
+
+
+@flyc.jit
 def stage_down(c, rgd, nu, ops0):
     """Latent rows 16 rgd ..: every slot's w2 against its picks (wave w the slots
     w, w + 8, ...; a batch of DOWN_BATCH in flight, the next issued under this
@@ -1344,61 +1390,17 @@ def stage_down(c, rgd, nu, ops0):
     rounding an add -> every rank's LATR."""
     # read before the traced branches (a dict lookup inside one is carried state)
     sent_latr = c.get("sent_latr", False)
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
-    rt = c["rt"]
-    t = fx.min(lane % 16, s - 1)
-    kb = lane // 16
-    nbs = DOWN_BATCH * W2_STEPS
+    s, tid, wave = c["S"], c["tid"], c["wave"]
     b0 = wave
     ops = ops0
-    while b0 < nu:
+    while b0 + WAVES * DOWN_BATCH < nu:
         nb = b0 + WAVES * DOWN_BATCH
-        ops_n = down_loads(c, rgd, nu, fx.min(nb, nu - 1))
-        slots = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
-        for j in range_constexpr(DOWN_BATCH):
-            live = (b0 + WAVES * j) < nu
-            k = fx.ptr_load(rt["kof"] + (slots[j] * 8 + t))
-            picked = (k >= 0) & (lane % 16 < s)
-            pick = t * TOPK + fx.max(k, 0)
-            acc = fx.Vector.filled(4, 0.0, fx.Float32)
-            # this slot's picks' INTER, polled here (not all of U first): a slot
-            # whose ug tasks are done is multiplied while later ones still run
-            for st in range_constexpr(W2_STEPS):
-                bw = fx.Vector(
-                    fx.ptr_load(
-                        c["interq"] + (pick * 48 + st * 16 + kb * 4),
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
-                )
-                scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
-                bw = fx.Vector.from_elements(
-                    [picked.select(bw[d], fx.Int32(0)) for d in range(4)], fx.Int32
-                )
-                sb = picked.select(scode, fx.Int32(UNIT_SCALE))
-                acc = mfma_scaled(
-                    ops[j * W2_STEPS + st],
-                    bw,
-                    acc,
-                    ops[nbs + j * W2_STEPS + st],
-                    sb,
-                    FP4,
-                    FP4,
-                    0,
-                    0,
-                )
-            # lane: rows 4 (lane / 16) + i of token lane % 16
-            if live & picked:
-                wt = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(
-                    fx.Float32
-                )
-                for i in range_constexpr(4):
-                    row = 4 * (lane // 16) + i
-                    fx.ptr_store(
-                        bf16_round(acc[i] * wt),
-                        c["contrib"] + ((t * TOPK + k) * ROWS + row),
-                    )
+        ops_n = down_loads(c, rgd, nu, nb)
+        down_batch(c, nu, ops, b0)
         b0 = nb
         ops = ops_n
+    if b0 < nu:
+        down_batch(c, nu, ops, b0)
     gpu.barrier()
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
@@ -1406,12 +1408,14 @@ def stage_down(c, rgd, nu, ops0):
         y0 = fx.Float32(0.0)
         y1 = fx.Float32(0.0)
         for k in range_constexpr(TOPK):
-            y0 = bf16_round(
-                y0 + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp))
+            values = fx.Vector(
+                fx.ptr_load(
+                    c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp),
+                    result_type=fx.Vector.make_type(2, fx.Float32),
+                )
             )
-            y1 = bf16_round(
-                y1 + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp + 1))
-            )
+            y0 = bf16_round(y0 + values[0])
+            y1 = bf16_round(y1 + values[1])
         if const_expr(sent_latr):
             si = sent_ix(c["rank"], rgd * ROWS + 2 * rp, tt, s, LAT)
             word = sent_word(bf16_pair(y0, y1))
