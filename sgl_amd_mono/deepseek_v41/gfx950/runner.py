@@ -71,9 +71,11 @@ def ug_all_at(s: int, tp: int) -> bool:
     """Whether every CTA takes ug tasks in a one-tile step, the shared expert's too.
 
     Those CTAs reach the ug stage late: a row or two route to too few experts for it to
-    pay, and at TP4 it gains nothing at 6 rows and spills more VGPRs at 12. Only a
-    one-tile step reads it (``ug_free``), so a wider one keeps the default key."""
-    return tp == 2 and s >= 3 and len(token_tiles(s)) == 1
+    pay. At TP4, eight rows have two ug rounds and enough late shared work to fill the
+    tail; six rows do not gain, and 12 spills more VGPRs. Only a one-tile step reads
+    this (``ug_free``), so a wider one keeps the default key."""
+    one_tile = len(token_tiles(s)) == 1
+    return one_tile and ((tp == 2 and s >= 3) or (tp == 4 and s == 8))
 
 
 def token_par_at(s: int, tp: int) -> bool:

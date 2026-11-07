@@ -511,9 +511,10 @@ def _silu_mul(g, u):
 def stage_shared(c, task, gops, uops, t0, n):
     """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID.
 
-    ``uops``: the up rows' loads where issued with the gate's (narrow steps, ``SHARED_UP_EARLY``);
+    ``uops``: the up rows' loads where issued with the gate's (``shared_up_early``);
     None: load them here, the gate rows' MFMAs done (wide steps are HBM-bound: the up rows'
-    early loads would steal the ug stage's bandwidth)."""
+    early loads would steal the ug stage's bandwidth, except where those loads shorten
+    the shared CTAs' path to their routed ug task)."""
     tid, red, d = c["tid"], c["red"], c["d"]
     a = c["args"]
     rows = None if isinstance(n, int) else n
@@ -1400,8 +1401,15 @@ def ug_free(key, rs) -> int:
 
 # up to this many tokens the shared expert's up rows load with its gate rows
 # (bandwidth is spare); wider, they load as the gate's MFMAs end (the ug stage's
-# weight flood would stall behind them)
+# weight flood would stall behind them), except TP4 width 8's shared/routed overlap
 SHARED_UP_EARLY = 4
+
+
+def shared_up_early(key) -> bool:
+    """Whether the shared up rows load with the gate rows for this build."""
+    return key.tokens <= SHARED_UP_EARLY or (
+        key.tokens == 8 and key.tp == 4 and key.ug_all
+    )
 
 
 @flyc.jit
@@ -1443,7 +1451,7 @@ def run_moe(c, key, bid, before_ug=None):
             gemv_fp8_loads(
                 c, a["sgu"], a["sgu_s"], HIDDEN, shared_tasks + unit % shared_tasks, row_major=True
             )
-            if const_expr(s <= SHARED_UP_EARLY)
+            if const_expr(shared_up_early(key))
             else None
         )
         if const_expr(not multi):
