@@ -51,6 +51,7 @@ from sgl_amd_mono.common.mx import (
 )
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_SYS,
     _xpartner,
     ballot,
     bf2_f32,
@@ -413,7 +414,7 @@ def early_out_lq(c, i, q, accs):
     """latq_push latent task (i, q): its two 16-row tiles' fp32 partials; part 0
     adds the parts in part order, rounds each row to bf16 (what LAT would hold),
     and quantizes the group's 32 columns -- one MXFP4 block -- as load_latq
-    does, then pushes the block's 4 words and its code to every rank's LATQ."""
+    does, then pushes the block's packed words before publishing its tagged code."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     region = c["lpart"]
     for h in range_constexpr(2):
@@ -432,34 +433,43 @@ def early_out_lq(c, i, q, accs):
                     v = v + f32_of(got[qq][0])
                 fx.ptr_store(bf16_round(v), c["av"] + (t * 2 * ROWS + h * ROWS + r))
         gpu.barrier()
-    if (q == 0) & (tid < s):
-        t = tid
+    blk = c["rank"] * LQ_GROUPS + i
+    if (q == 0) & (tid < s * 4):
+        t = tid // 4
+        q4 = tid % 4
         ws = [
             bf16_pair(
-                fx.ptr_load(c["av"] + (t * 2 * ROWS + 2 * j)),
-                fx.ptr_load(c["av"] + (t * 2 * ROWS + 2 * j + 1)),
+                fx.ptr_load(c["av"] + (t * 2 * ROWS + 8 * q4 + 2 * j)),
+                fx.ptr_load(c["av"] + (t * 2 * ROWS + 8 * q4 + 2 * j + 1)),
             ).bitcast(fx.Int32)
-            for j in range(16)
+            for j in range(4)
         ]
         am = fx.Int32(0)
-        for w in ws:
-            am = fx.max(am, w & 0x7FFF)
-            am = fx.max(am, (w >> 16) & 0x7FFF)
+        for word in ws:
+            am = fx.max(am, word & 0x7FFF)
+            am = fx.max(am, (word >> 16) & 0x7FFF)
+        am = butterfly(am, (1, 2), fx.max)
         amax = (am << 16).bitcast(fx.Float32)
         code = e8m0_roundup(amax)
         scale = (code << 23).bitcast(fx.Float32)
-        pks = []
-        for q4 in range_constexpr(4):
-            pk = fx.Int32(0)
-            for j in range_constexpr(4):
-                pk = pk_fp4_bf16(pk, ws[4 * q4 + j], scale, j)
-            pks.append(pk)
-        blk = c["rank"] * LQ_GROUPS + i
-        for p in range_constexpr(TP):
-            # two pairs a store: a buffer store moves at most 128 bits
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + blk * 4, pks[:2])
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + blk * 4 + 2, pks[2:])
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + LAT // 8 + blk, [code])
+        packed = fx.Int32(0)
+        for j in range_constexpr(4):
+            packed = pk_fp4_bf16(packed, ws[j], scale, j)
+        adjacent = _xpartner(packed, 1, lane)
+        third = _xpartner(packed, 2, lane)
+        fourth = _xpartner(third, 1, lane)
+        if q4 == 0:
+            for p in range_constexpr(TP):
+                bo.buffer_store(
+                    fx.Vector.from_elements([packed, adjacent, third, fourth], fx.Int32),
+                    rsrc(c["peer"]["latq"][p].value),
+                    t * (LAT // 8) + blk * 4,
+                    cache_modifier=CM_SYS,
+                )
+            rocdl.s_waitcnt(vmcnt=0)
+            for p in range_constexpr(TP):
+                codes = shift(c["peer"]["latq"][p], s * (LAT // 8) * 4)
+                c["put"](codes, t * (LAT // 32) + blk, code)
     gpu.barrier()
 
 
@@ -1070,30 +1080,34 @@ def load_latq(c):
     """LAT (every rank's 448 columns) -> MXFP4 as aiter's inline quant: a
     thread a (token, 32-block): amax of |bf16| bits, the ceil code of amax / 6,
     v_cvt_scalef32_pk_fp4_bf16 -> latq words, latsc codes. Under ``latq_push``
-    the producers quantized it: every rank's words and codes are polled in."""
+    the producers quantized it: poll each block's tagged code, then vector-load
+    the four packed words whose publication preceded that code."""
     s, tid = c["S"], c["tid"]
     push = c.get("latq_push", False)
     if const_expr(push):
-        n = s * LQ_WORDS
+        n = s * (LAT // 32)
         per = (n + THREADS - 1) // THREADS
+        codes = shift(c["peer"]["latq_own"], s * (LAT // 8) * 4)
         got = c["poll"](
             [
-                (c["peer"]["latq_own"], fx.min(tid + THREADS * i, n - 1), 1)
+                (codes, fx.min(tid + THREADS * i, n - 1), 1)
                 for i in range(per)
             ]
         )
         for i in range_constexpr(per):
-            e = tid + THREADS * i
-            ec = fx.min(e, n - 1)
-            t = ec // LQ_WORDS
-            w = ec % LQ_WORDS
-            if e < n:
-                if w < LAT // 8:
-                    fx.ptr_store(got[i][0], c["latq"] + (t * (LAT // 8) + w))
-                else:
-                    fx.ptr_store(
-                        got[i][0], c["latsc"] + (t * (LAT // 32) + w - LAT // 8)
+            b = tid + THREADS * i
+            if b < n:
+                fx.ptr_store(got[i][0], c["latsc"] + b)
+                words = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(c["peer"]["latq_own"].value),
+                        b * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_SYS,
                     )
+                )
+                fx.ptr_store(words, c["latq"] + b * 4)
         gpu.barrier()
         return
     nblk = s * (LAT // 32)
