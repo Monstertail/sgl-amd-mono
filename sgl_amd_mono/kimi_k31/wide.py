@@ -25,20 +25,34 @@ state: slot -1).
 """
 
 import os
+import sys
 
 import torch
 
 # The SGLang names this module reads (test/unit/test_contract.py).
+def _column_tail_max_tokens(moe) -> int:
+    """SGLang's column-tail row cap: its environ knob where it has one, else the constant
+    its kimi_k3_amd MoE capped the column tail with before the knob."""
+    from sglang.srt.environ import envs
+
+    knob = getattr(envs, "SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS", None)
+    if knob is not None:
+        return knob.get()
+    return sys.modules[type(moe).__module__]._COLUMN_TAIL_MAX_TOKENS
+
+
 SGLANG_READS = {
+    # the column-tail cap knob, where this SGLang has one
+    "srt/environ.py": ("envs",),
     "srt/runtime_context.py": ("get_spec",),
     "srt/models/kimi_k3.py": ("KimiK3MoE", "AuxHiddenStateList", "_cdiv"),
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
     "srt/models/kimi_k3_amd/moe.py": (
         "_vector_aligned",
         "_forward_shared_casting_routed",
+        "_COLUMN_TAIL_MAX_TOKENS",
     ),
     # the row cap of SGLang's column tail, which _column_exit must not exceed
-    "srt/environ.py": ("envs", "SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS"),
     "srt/layers/attn_residual_hip.py": ("gather_covers",),
     "srt/layers/attention/linear/utils.py": (
         "select_verify_intermediate_state_indices",
@@ -707,7 +721,6 @@ class Wide:
         read. None, before anything runs, when SGLang's kernels do not take the batch."""
         import sglang.kernels.ops.attention.k3_attn_res_read_hip as hip
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from sglang.srt.environ import envs
         from sglang.srt.layers.attn_residual_hip import gather_covers
 
         read = moe.next_attn_read
@@ -715,7 +728,7 @@ class Wide:
             not self.column_exit
             or read is None
             # _column_tail_and_next_read's own cap: past it, it would decline after the all-reduce
-            or rows > envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
+            or rows > _column_tail_max_tokens(moe)
             or not moe._fused_latent_tail_eligible
         ):
             return None
