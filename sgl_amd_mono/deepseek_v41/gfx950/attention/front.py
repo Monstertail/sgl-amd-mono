@@ -600,12 +600,19 @@ def run_front(
             for i in range(wqb_per_cta)
         ]
 
+    slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
+    early_steps = 1 if s == 8 else 0
+    first_slots = [(ch, steps[:early_steps]) for ch, steps in slots]
+    rest_slots = [(ch, steps[early_steps:]) for ch, steps in slots]
+    first_ops = chain_loads(
+        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, first_slots, has_wqkv, c["shuffled"]
+    )
     if const_expr(before_wqkv is not None):
         before_wqkv()
-    slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
-    kops = chain_loads(
-        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
+    rest_ops = chain_loads(
+        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, rest_slots, has_wqkv, c["shuffled"]
     )
+    kops = [first + rest for first, rest in zip(first_ops, rest_ops)]
     if const_expr(after_wqkv is not None):
         after_wqkv()
     # one token tile: the wq_b weights here on a CTA without a wqkv tile (the qkv stage's polls

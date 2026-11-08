@@ -1024,9 +1024,25 @@ def stage_down(c, tasks, ahead):
             loads = down_weights(c, tasks, rnd + 1, slots, nu)
             down_round(c, tasks, sl, sw, slots, nu, us, firsts, counts, mids, avs)
     else:
-        # the shared expert's down projection first: its input is ready long before the routed results
-        down_shared(c, tasks)
-        for rnd in range(0, rounds, 1):
+        if const_expr(n == 2):
+            svs0, avs0 = down_weights(c, tasks[:1], 0, slots, nu)
+            svs1, avs1 = down_shared(
+                c, tasks, lambda: down_weights(c, tasks[1:], 0, slots, nu)
+            )
+            svs, avs = svs0 + svs1, avs0 + avs1
+        else:
+            svs, avs = down_weights(c, tasks, 0, slots, nu)
+            down_shared(c, tasks)
+        us = [wave + WAVES * i for i in range(slots)]
+        ucs = [fx.min(u, nu - 1) for u in us]
+        firsts = [c["rs"].slot_first(tab, u) for u in ucs]
+        c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
+        counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
+        mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
+        for q in range_constexpr(len(svs)):
+            scale_block_store(c, svs[q], sl + q * sw)
+        down_round(c, tasks, sl, sw, slots, nu, us, firsts, counts, mids, avs)
+        for rnd in range(1, rounds, 1):
             us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
             ucs = [fx.min(u, nu - 1) for u in us]
             firsts = [c["rs"].slot_first(tab, u) for u in ucs]
@@ -1168,10 +1184,11 @@ def _down_ug_flag(c, ucs, f, per_slot):
 
 
 @flyc.jit
-def down_shared(c, tasks):
+def down_shared(c, tasks, prefetch=None):
     """Run the shared expert's down projection of ``tasks``' rows for every token into LDS."""
     s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
     a = c["args"]
+    loads = None
     shops = [
         gemv_fp8_loads(c, a["sw2"], a["sw2_s"], d.sh_inter, task, row_major=True)
         for task in tasks
@@ -1182,12 +1199,16 @@ def down_shared(c, tasks):
             gemv_fp8_mfmas(
                 c, d.sh_inter, c["shared_xl"], c["shared_xsl"], red, shops[j], rows=nn
             )
+            if const_expr(prefetch is not None and j == 0):
+                loads = prefetch()
             gpu.barrier()
             if tid < ROWS * nn:
                 v = row_sum(red, tid % ROWS, tid // ROWS)
                 at = (j * s + plus(t0, tid // ROWS)) * ROWS + tid % ROWS
                 fx.ptr_store(bf16_round(v).bitcast(fx.Int32), c["sdl"] + at)
             gpu.barrier()
+    if const_expr(prefetch is not None):
+        return loads
 
 
 @flyc.jit
