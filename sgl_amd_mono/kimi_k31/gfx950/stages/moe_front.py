@@ -161,12 +161,41 @@ def _okey(v):
     return fx.Uint32((b < fx.Int32(0)).select(~b, b ^ fx.Int32(-2147483648)))
 
 
+def _tie_rank(e):
+    vec = e >> 2
+    lane = vec & 63
+    low = (lane & 3) ^ ((lane & 4) != 0).select(fx.Int32(3), fx.Int32(0))
+    bit2 = (((lane >> 2) ^ (lane >> 3)) & 1) << 2
+    return ((((~lane) & 0x38) | bit2 | low) << 5) | ((vec >> 6) << 2) | (e & 3)
+
+
+def _tie_expert(rank):
+    lane_rank = rank >> 5
+    lane_hi = (~lane_rank) & 0x38
+    lane_bit3 = (lane_hi >> 3) & 1
+    lane_bit2 = ((rank >> 7) & 1) ^ lane_bit3
+    low = (lane_rank & 3) ^ (lane_bit2 != 0).select(fx.Int32(3), fx.Int32(0))
+    lane = lane_hi | (lane_bit2 << 2) | low
+    return ((rank & 31) >> 2 << 8) | (lane << 2) | (rank & 3)
+
+
 @flyc.jit
 def route_row(
-    c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_out=None
+    c,
+    row,
+    m,
+    rbf,
+    nbf,
+    bn,
+    bias,
+    lat_out,
+    topk_ids,
+    topk_w,
+    logits_out=None,
+    compute_topk=True,
 ):
-    """The row's gathered latent -> the experts' input; top-16 of the gathered logits
-    (and the logits themselves -> ``logits_out`` f32 [m, 896], for SGLang's own top-k)."""
+    """The row's gathered latent -> the experts' input; optionally its top-16,
+    and the logits -> ``logits_out`` f32 [m, 896] for SGLang's own top-k."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     nt = gathered_tiles(bn)
@@ -188,8 +217,19 @@ def route_row(
         )
         bo.buffer_store(v, rsrc(lat_out), (row * LAT + 8 * u) // 2)
     if const_expr(logits_out is not None):
-        for e in range(tid, E, THREADS):
-            bo.buffer_store(_ld_sys(rg, row * E + e), rsrc(logits_out), row * E + e)
+        for e in range(tid, E // 4, THREADS):
+            v = fx.Vector(
+                bo.buffer_load(
+                    rg,
+                    row * E + 4 * e,
+                    vec_width=4,
+                    dtype=T.f32,
+                    cache_modifier=CM_SYS,
+                )
+            )
+            bo.buffer_store(v, rsrc(logits_out), row * E + 4 * e)
+    if const_expr(not compute_topk):
+        return
     if wave == 0:
         # max-extraction (as the K3 K2 launch, mono/kimi-k31 05dfa48): each lane sorts its 14 candidates (expert
         # lane + 64 i; key descending, the lower expert first on a tie), then 16 rounds of a wave max pop the heads;
@@ -200,10 +240,10 @@ def route_row(
             e = lane + 64 * i
             s = _sigmoid(_ld_sys(rg, row * E + e))
             ks.append(_okey(s + ld_f32(bias, e)))
-            ids.append(fx.Int32(e))
+            ids.append(_tie_rank(e))
             sg.append(s.bitcast(fx.Int32))
         ks += [fx.Uint32(0)] * (SLOTS - per)
-        ids += [fx.Int32(1023)] * (SLOTS - per)
+        ids += [fx.Int32(2048)] * (SLOTS - per)
         sg += [fx.Int32(0)] * (SLOTS - per)
         for x, y in NET:
             first = (ks[x] > ks[y]) | ((ks[x] == ks[y]) & (ids[x] < ids[y]))
@@ -212,18 +252,19 @@ def route_row(
             ids[x], ids[y] = first.select(ix, iy), first.select(iy, ix)
             sg[x], sg[y] = first.select(sx, sy), first.select(sy, sx)
         ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
-        ids = ids + [fx.Int32(1023)]
+        ids = ids + [fx.Int32(2048)]
         sg = sg + [fx.Int32(0)]
         tot, sel_i, sel_s = fx.Float32(0.0), fx.Int32(0), fx.Int32(0)
         for k in range_constexpr(TOPK):
             mx = wave_umax(ks[0])
-            expert = fx.Int32(1023) - wave_umax(
-                (ks[0] == mx).select(fx.Int32(1023) - ids[0], fx.Int32(0))
+            winner = fx.Int32(2048) - wave_umax(
+                (ks[0] == mx).select(fx.Int32(2048) - ids[0], fx.Int32(0))
             )
+            expert = _tie_expert(winner)
             sig = read_lane_i32(
                 sg[0], expert % 64
             )  # the winner's sigmoid, before its lane pops its head
-            hit = (ks[0] == mx) & (ids[0] == expert)
+            hit = (ks[0] == mx) & (ids[0] == winner)
             ks = [hit.select(ks[i + 1], ks[i]) for i in range(SLOTS)] + [ks[-1]]
             ids = [hit.select(ids[i + 1], ids[i]) for i in range(SLOTS)] + [ids[-1]]
             sg = [hit.select(sg[i + 1], sg[i]) for i in range(SLOTS)] + [sg[-1]]

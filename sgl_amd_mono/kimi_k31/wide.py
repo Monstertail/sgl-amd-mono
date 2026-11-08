@@ -468,6 +468,7 @@ class Wide:
             t1=v["t1"],
             restart=v["restart"],
             half_bytes=self.half[b],
+            route_topk=False,
         )[0]
 
     def warmup(self, buckets=None):

@@ -157,6 +157,7 @@ def kda_layer(
     restart=False,
     half_bytes=0,
     timeline=False,
+    route_topk=True,
 ):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
@@ -181,7 +182,8 @@ def kda_layer(
     router logits, for SGLang's own top-k and experts. ``half_bytes``: lay the peer
     buffer out with at least this half size (every variant sharing one buffer must
     agree on its halves and on where the guard's flags are). ``timeline``: per-CTA clock marks (MARKS) -> the
-    scratch region ``tl``, int64 [BLOCKS, TL_POINTS]."""
+    scratch region ``tl``, int64 [BLOCKS, TL_POINTS]. ``route_topk=False`` skips
+    the launch's duplicate top-k when the caller uses SGLang's routing outputs."""
     key = (
         m,
         cfg.key(),
@@ -201,6 +203,7 @@ def kda_layer(
         restart,
         half_bytes,
         timeline,
+        route_topk,
     )
     if key in _BUILDS:
         return _BUILDS[key]
@@ -287,6 +290,7 @@ def kda_layer(
         f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
         f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
         + ("_tl" if timeline else "")
+        + ("" if route_topk else "_rt0")
         + "_cs_pH_rp"
     )
 
@@ -709,6 +713,7 @@ def kda_layer(
                     a7.topk_ids,
                     a7.topk_w,
                     a7.logits_out,
+                    route_topk,
                 )
             stamp(timeline, tls, tid, 10)
             for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
