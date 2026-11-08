@@ -8,10 +8,10 @@ static weights stream while the AttnRes chain (partials -> reduce -> slice ->
 gate -> mix) is still settling: the CTAs that will run the router, latent and
 shared gate/up GEMVs issue their weights before they first wait.
 
-    CTAs 0 .. 55     K2a's reduce + AttnRes (slice, gate, mix -> x rows + XRDY);
-                     then route (0 .. S-1) and the shared SiTU (8 .. 8+S-1)
-    CTAs 56 .. 159   o_proj (448 x 16 rows) -> partials to every rank; then
-                     the shared gate/up (96 tasks, weights right after o_proj)
+    CTAs 0 .. 55     one o_proj tail task, then K2a's reduce + AttnRes;
+                     then route (0 .. S-1) and the shared SiTU
+    CTAs 56 .. 255   two o_proj tasks each -> partials to every rank; then the
+                     shared gate/up or the router / latent projections
     CTAs 160 .. 243  router parts (28) and latent parts (56): weights first
     every CTA        ug; down (0 .. 223) or the shared down (224 .. 255);
                      lnorm (56 .. 83), up (0 .. 55), reduce (200 .. 255)
@@ -21,7 +21,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 import torch
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64
 
 from sgl_amd_mono.common import guard
@@ -63,7 +63,15 @@ SOURCES = kernel_sources(__name__)
 O0, O1 = NA, BLOCKS  # o_proj CTAs: every CTA past AttnRes's
 O_N = O1 - O0  # 200
 OTASKS = k2a.OTASKS  # 448
-O_ROUNDS = (OTASKS + O_N - 1) // O_N  # 5
+O_ROUNDS = 2
+O_PAIRS = 192
+O_MAIN_SINGLES = O_N - O_PAIRS
+O_TAIL = OTASKS - O_ROUNDS * O_PAIRS - O_MAIN_SINGLES
+TAIL_AFTER_PRELOAD_MAX_BLOCKS = 6
+assert (
+    0 < O_TAIL <= NA
+    and O_ROUNDS * O_PAIRS + O_MAIN_SINGLES + O_TAIL == OTASKS
+)
 E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 H0 = 8  # the shared SiTU's CTAs (after their AttnRes work)
 SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
@@ -236,14 +244,34 @@ def scratch_bytes(key: K2Build) -> int:
 
 @flyc.jit
 def stage_oproj(c, gi):
-    """o_proj tasks gi, gi + 200, gi + 400 (< 448): every task's weights in
-    flight at once (one memory latency, not three), then the MFMAs."""
-    ops = [k2a.o_loads(c, fx.min(gi + O_N * j, OTASKS - 1)) for j in range(O_ROUNDS)]
-    k2a.load_core(c)
-    for j in range_constexpr(O_ROUNDS):
-        t = gi + O_N * j
-        if t < OTASKS:
-            k2a.stage_o(c, t, ops[j])
+    """Two tasks on most CTAs, with eight single-task CTAs at the end."""
+    if gi < O_PAIRS:
+        first0 = k2a.o_load_chunk(c, gi, 0)
+        first1 = k2a.o_load_chunk(c, gi + O_N, 0)
+        second0 = k2a.o_zero_chunk()
+        second1 = k2a.o_zero_chunk()
+        if c["wave"] + WAVES < k2a.OKCH:
+            second0 = k2a.o_load_chunk(c, gi, 1)
+            second1 = k2a.o_load_chunk(c, gi + O_N, 1)
+        ops = [[first0, second0], [first1, second1]]
+        k2a.load_core(c)
+        k2a.stage_o_pair(c, gi, ops)
+    else:
+        stage_oproj_tail(c, gi)
+
+
+@flyc.jit
+def stage_oproj_tail(c, task, trailing_barrier=True):
+    """One o_proj tail task before an AttnRes CTA starts reducing."""
+    first = k2a.o_load_chunk(c, task, 0)
+    second = k2a.o_zero_chunk()
+    if c["wave"] + WAVES < k2a.OKCH:
+        second = k2a.o_load_chunk(c, task, 1)
+    rocdl.s_waitcnt(vmcnt=0)
+    if const_expr(trailing_barrier):
+        k2a.stage_o(c, task, [first, second])
+    else:
+        k2a.stage_o_no_trailing_barrier(c, task, [first, second])
 
 
 _BUILDS: dict = {}
@@ -301,7 +329,7 @@ def build(key: K2Build):
 
     @fx.struct
     class Smem:
-        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        red: fx.Array[fx.Float32, 2 * k2b.RED_WORDS, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, SOURCES)
@@ -505,6 +533,13 @@ def build(key: K2Build):
                 c[region] = sreg(scratch, lay[region][0], region)
             on, tls = key.timeline, lds.tls.ptr
             stamp_begin(on, tls, tid, TL_POINTS)
+            if const_expr(key.nblocks > TAIL_AFTER_PRELOAD_MAX_BLOCKS):
+                if bid < O_TAIL:
+                    stage_oproj_tail(
+                        c,
+                        O_ROUNDS * O_PAIRS + O_MAIN_SINGLES + bid,
+                        trailing_barrier=False,
+                    )
             # ---- o_proj on every CTA past AttnRes's
             eb = bid - E0
             lb = eb - k2b.R_TASKS
@@ -532,6 +567,9 @@ def build(key: K2Build):
             if bid < NA:
                 # PRELOAD: the slice's loads in flight across the o_proj poll
                 sld = slice_loads(c, bid) if key.opt & OPT_PRELOAD else None
+                if const_expr(key.nblocks <= TAIL_AFTER_PRELOAD_MAX_BLOCKS):
+                    if bid < O_TAIL:
+                        stage_oproj_tail(c, O_ROUNDS * O_PAIRS + O_MAIN_SINGLES + bid)
                 k2a.stage_reduce(c, bid)
                 stamp(on, tls, tid, 1)
                 stage_slice(c, bid, sld)
@@ -580,10 +618,12 @@ def build(key: K2Build):
                 stamp(on, tls, tid, 16)
             if const_expr(key.opt & OPT_SDOWN_FIRST):
                 k2b.run_sdown_first(c, bid, w_sd)
-                k2b.run_sdown_rest(c, bid, w_sd)
+                # Stages reached by CTAs skipping this barrier must leave
+                # red and xl untouched until their next barrier.
+                k2b.run_sdown_rest(c, bid, w_sd, h_ready=True, tail_barrier=False)
             else:
                 k2b.run_sdown_rest(c, bid, w_sd)
-                k2b.run_sdown(c, bid, w_sd)
+                k2b.run_sdown(c, bid, w_sd, h_ready=True)
             stamp(on, tls, tid, 4)
             if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
                 k2b.stage_lnorm(c, bid - k2b.LN0)

@@ -51,6 +51,7 @@ from sgl_amd_mono.common.mx import (
 )
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_SYS,
     _xpartner,
     ballot,
     bf2_f32,
@@ -163,16 +164,20 @@ UP_N = HIDDEN // TP  # 896 columns a rank up-projects
 UP_TASKS = UP_N // ROWS  # 56
 LN_TASKS = LAT // 128  # 28
 LN0 = 56  # lnorm's CTAs
-RED_TASKS = HIDDEN // 128  # 56
-RED0 = 200
+RED_COLS = 64
+RED_TASKS = HIDDEN // RED_COLS
+RED0 = BLOCKS - RED_TASKS
 UG_GROUPS = RI // 32  # 12
 W13_K = LAT  # 3584
 W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
 DOWN_TASKS = LAT // ROWS  # 224
+RED_WORDS = WAVES * 64 * 4
 DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
 MAX_U = 8 * TOPK
 TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
+assert DOWN_TASKS >= LN0 + LN_TASKS
+assert UP_TASKS + BLOCKS - 1 - (LN0 + LN_TASKS) < SD_TASKS
 
 _STREAM = fx.Stream(None)
 
@@ -317,6 +322,21 @@ def pk_fp4_bf16(old, word, scale, j):
     )
 
 
+def row_sum_pair(red, r, t):
+    lo = fx.Float32(0.0)
+    hi = fx.Float32(0.0)
+    for w in range(WAVES):
+        v = fx.Vector(
+            fx.ptr_load(
+                red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4),
+                result_type=fx.Vector.make_type(2, fx.Float32),
+            )
+        )
+        lo = lo + v[0]
+        hi = hi + v[1]
+    return lo, hi
+
+
 # ---------------------------------------------------------------- early
 @flyc.jit
 def early_out(c, kind, i, q, red):
@@ -344,8 +364,9 @@ def early_out(c, kind, i, q, red):
         if tid < (ROWS // 2) * s:
             rp = tid % (ROWS // 2)
             t = tid // (ROWS // 2)
-            v0 = bf16_round(row_sum(red, 2 * rp, t))
-            v1 = bf16_round(row_sum(red, 2 * rp + 1, t))
+            v0, v1 = row_sum_pair(red, 2 * rp, t)
+            v0 = bf16_round(v0)
+            v1 = bf16_round(v1)
             c["put_bf"](c["sgu"], t * 2 * SI + i * ROWS + 2 * rp, [v0, v1])
     else:
         parts = R_PARTS if kind == 0 else L_PARTS
@@ -393,7 +414,7 @@ def early_out_lq(c, i, q, accs):
     """latq_push latent task (i, q): its two 16-row tiles' fp32 partials; part 0
     adds the parts in part order, rounds each row to bf16 (what LAT would hold),
     and quantizes the group's 32 columns -- one MXFP4 block -- as load_latq
-    does, then pushes the block's 4 words and its code to every rank's LATQ."""
+    does, then pushes the block's packed words before publishing its tagged code."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     region = c["lpart"]
     for h in range_constexpr(2):
@@ -412,34 +433,43 @@ def early_out_lq(c, i, q, accs):
                     v = v + f32_of(got[qq][0])
                 fx.ptr_store(bf16_round(v), c["av"] + (t * 2 * ROWS + h * ROWS + r))
         gpu.barrier()
-    if (q == 0) & (tid < s):
-        t = tid
+    blk = c["rank"] * LQ_GROUPS + i
+    if (q == 0) & (tid < s * 4):
+        t = tid // 4
+        q4 = tid % 4
         ws = [
             bf16_pair(
-                fx.ptr_load(c["av"] + (t * 2 * ROWS + 2 * j)),
-                fx.ptr_load(c["av"] + (t * 2 * ROWS + 2 * j + 1)),
+                fx.ptr_load(c["av"] + (t * 2 * ROWS + 8 * q4 + 2 * j)),
+                fx.ptr_load(c["av"] + (t * 2 * ROWS + 8 * q4 + 2 * j + 1)),
             ).bitcast(fx.Int32)
-            for j in range(16)
+            for j in range(4)
         ]
         am = fx.Int32(0)
-        for w in ws:
-            am = fx.max(am, w & 0x7FFF)
-            am = fx.max(am, (w >> 16) & 0x7FFF)
+        for word in ws:
+            am = fx.max(am, word & 0x7FFF)
+            am = fx.max(am, (word >> 16) & 0x7FFF)
+        am = butterfly(am, (1, 2), fx.max)
         amax = (am << 16).bitcast(fx.Float32)
         code = e8m0_roundup(amax)
         scale = (code << 23).bitcast(fx.Float32)
-        pks = []
-        for q4 in range_constexpr(4):
-            pk = fx.Int32(0)
-            for j in range_constexpr(4):
-                pk = pk_fp4_bf16(pk, ws[4 * q4 + j], scale, j)
-            pks.append(pk)
-        blk = c["rank"] * LQ_GROUPS + i
-        for p in range_constexpr(TP):
-            # two pairs a store: a buffer store moves at most 128 bits
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + blk * 4, pks[:2])
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + blk * 4 + 2, pks[2:])
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + LAT // 8 + blk, [code])
+        packed = fx.Int32(0)
+        for j in range_constexpr(4):
+            packed = pk_fp4_bf16(packed, ws[j], scale, j)
+        adjacent = _xpartner(packed, 1, lane)
+        third = _xpartner(packed, 2, lane)
+        fourth = _xpartner(third, 1, lane)
+        if q4 == 0:
+            for p in range_constexpr(TP):
+                bo.buffer_store(
+                    fx.Vector.from_elements([packed, adjacent, third, fourth], fx.Int32),
+                    rsrc(c["peer"]["latq"][p].value),
+                    t * (LAT // 8) + blk * 4,
+                    cache_modifier=CM_SYS,
+                )
+            rocdl.s_waitcnt(vmcnt=0)
+            for p in range_constexpr(TP):
+                codes = shift(c["peer"]["latq"][p], s * (LAT // 8) * 4)
+                c["put"](codes, t * (LAT // 32) + blk, code)
     gpu.barrier()
 
 
@@ -1012,30 +1042,34 @@ def load_latq(c):
     """LAT (every rank's 448 columns) -> MXFP4 as aiter's inline quant: a
     thread a (token, 32-block): amax of |bf16| bits, the ceil code of amax / 6,
     v_cvt_scalef32_pk_fp4_bf16 -> latq words, latsc codes. Under ``latq_push``
-    the producers quantized it: every rank's words and codes are polled in."""
+    the producers quantized it: poll each block's tagged code, then vector-load
+    the four packed words whose publication preceded that code."""
     s, tid = c["S"], c["tid"]
     push = c.get("latq_push", False)
     if const_expr(push):
-        n = s * LQ_WORDS
+        n = s * (LAT // 32)
         per = (n + THREADS - 1) // THREADS
+        codes = shift(c["peer"]["latq_own"], s * (LAT // 8) * 4)
         got = c["poll"](
             [
-                (c["peer"]["latq_own"], fx.min(tid + THREADS * i, n - 1), 1)
+                (codes, fx.min(tid + THREADS * i, n - 1), 1)
                 for i in range(per)
             ]
         )
         for i in range_constexpr(per):
-            e = tid + THREADS * i
-            ec = fx.min(e, n - 1)
-            t = ec // LQ_WORDS
-            w = ec % LQ_WORDS
-            if e < n:
-                if w < LAT // 8:
-                    fx.ptr_store(got[i][0], c["latq"] + (t * (LAT // 8) + w))
-                else:
-                    fx.ptr_store(
-                        got[i][0], c["latsc"] + (t * (LAT // 32) + w - LAT // 8)
+            b = tid + THREADS * i
+            if b < n:
+                fx.ptr_store(got[i][0], c["latsc"] + b)
+                words = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(c["peer"]["latq_own"].value),
+                        b * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_SYS,
                     )
+                )
+                fx.ptr_store(words, c["latq"] + b * 4)
         gpu.barrier()
         return
     nblk = s * (LAT // 32)
@@ -1176,17 +1210,21 @@ def stage_ug(c, task, ops):
     v = situ_aiter(gv, uv)
     amax = butterfly(abs(v), (16, 8, 4, 2, 1), fx.max)
     code = e8m0_roundup(amax)
-    gpu.barrier()
     fx.ptr_store(v, c["av"] + tid)
     gpu.barrier()
     k = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
     if live & (col < 4) & (k >= 0):
         scale = (code << 23).bitcast(fx.Float32)
         pk = fx.Int32(0)
-        for j in range_constexpr(4):
-            x0 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j))
-            x1 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j + 1))
-            pk = pk_fp4_f32(pk, x0, x1, scale, j)
+        for q in range_constexpr(2):
+            values = fx.Vector(
+                fx.ptr_load(
+                    c["av"] + (tt * 32 + col * 8 + q * 4),
+                    result_type=fx.Vector.make_type(4, fx.Float32),
+                )
+            )
+            pk = pk_fp4_f32(pk, values[0], values[1], scale, 2 * q)
+            pk = pk_fp4_f32(pk, values[2], values[3], scale, 2 * q + 1)
         pick = tt * TOPK + k
         c["put_words"](c["inter"], pick * 48 + g * 4 + col, [pk])
         if col == 0:
@@ -1427,11 +1465,12 @@ def load_h(c):
 
 
 @flyc.jit
-def stage_sdown(c, j, ops):
+def stage_sdown(c, j, ops, buf=0, defer=False):
     """Shared down rows 16 j .. (K 768) against h in LDS (``load_h``): bf16
     partial -> SHP (this rank's up columns) or every rank's FINAL."""
     sent_final = c.get("sent_final", False)
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    red = c["red"] + buf * RED_WORDS
     hrow = SI + gemv.LDS_PAD
     acc = gemv.mfmas(lane, wave, c["xl"], hrow, SI, s, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
@@ -1441,8 +1480,9 @@ def stage_sdown(c, j, ops):
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0, v1 = row_sum_pair(red, 2 * rp, tt)
+        v0 = bf16_round(v0)
+        v1 = bf16_round(v1)
         if mine:
             w = (
                 fx.Vector.from_elements([v0, v1], fx.Float32)
@@ -1457,22 +1497,20 @@ def stage_sdown(c, j, ops):
             )
         else:
             put_final(c, j * ROWS + 2 * rp, tt, v0, v1, sent_final)
-    publish(
-        c["put"],
-        c["shrdy"],
-        fx.max(fx.min(j - lo, UP_TASKS - 1), 0),
-        fx.Int32(1),
-        (tid == 0) & mine,
-    )
-    gpu.barrier()
+    if mine:
+        publish(c["put"], c["shrdy"], j - lo, fx.Int32(1), tid == 0)
+    elif const_expr(not defer):
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
 
 
 @flyc.jit
-def run_sdown(c, bid, w_sd):
+def run_sdown(c, bid, w_sd, h_ready=False):
     """This rank's 56 shared-down tasks whose columns the up stage adds to (k ->
     row group (k + 56 rank) % 448), on the CTAs past the down tasks: up waits
     on them."""
-    load_h(c)
+    if const_expr(not h_ready):
+        load_h(c)
     lo = c["rank"] * UP_TASKS
     if bid >= DOWN_TASKS:
         for k in range(bid - DOWN_TASKS, UP_TASKS, BLOCKS - DOWN_TASKS):
@@ -1503,17 +1541,50 @@ def run_sdown_first(c, bid, w_sd):
 
 
 @flyc.jit
-def run_sdown_rest(c, bid, w_sd):
+def run_sdown_early(c, bid, w_sd, r0):
+    """All 448 shared-down tasks on the CTAs from ``r0`` (past AttnRes's), between
+    their early work and the route: h is ready by then and these CTAs would only
+    wait, so the shared expert leaves the tail (up and the final reduce wait on
+    it there). This rank's up columns first: up waits on them."""
+    if bid >= r0:
+        load_h(c)
+        lo = c["rank"] * UP_TASKS
+        for k in range(bid - r0, SD_TASKS, BLOCKS - r0):
+            j = (k + lo) % SD_TASKS
+            stage_sdown(c, j, gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI))
+
+
+@flyc.jit
+def run_sdown_rest(c, bid, w_sd, h_ready=False, tail_barrier=True):
     """The other 392 shared-down tasks (only the final reduce waits on them), on
     the CTAs past lnorm / up's (84 ..), after their down: off the latent-norm ->
     up critical path."""
     r0 = LN0 + LN_TASKS  # 84: past the lnorm / up CTAs
     if bid >= r0:
-        load_h(c)
         lo = c["rank"] * UP_TASKS
-        for k in range(UP_TASKS + bid - r0, SD_TASKS, BLOCKS - r0):
+        step = BLOCKS - r0
+        k = UP_TASKS + bid - r0
+        buf = fx.Int32(0)
+        ops = gemv.loads(c["lane"], c["wave"], w_sd, ((k + lo) % SD_TASKS) * ROWS, SI)
+        if const_expr(h_ready):
+            if bid < DOWN_TASKS:
+                load_h(c)
+        else:
+            load_h(c)
+        while k + step < SD_TASKS:
+            nxt = k + step
+            ops_n = gemv.loads(
+                c["lane"], c["wave"], w_sd, ((nxt + lo) % SD_TASKS) * ROWS, SI
+            )
             j = (k + lo) % SD_TASKS
-            stage_sdown(c, j, gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI))
+            stage_sdown(c, j, ops, buf=buf, defer=True)
+            k = nxt
+            ops = ops_n
+            buf = fx.Int32(1) - buf
+        stage_sdown(c, (k + lo) % SD_TASKS, ops, buf=buf, defer=True)
+        rocdl.s_waitcnt(vmcnt=0)
+        if const_expr(tail_barrier):
+            gpu.barrier()
 
 
 # ---------------------------------------------------------------- lnorm / up / reduce
@@ -1605,6 +1676,7 @@ def stage_up(c, j):
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
+        v0, v1 = row_sum_pair(red, 2 * rp, tt)
         w = fx.Int32(
             bo.buffer_load(
                 rsrc(c["shp"]),
@@ -1614,8 +1686,8 @@ def stage_up(c, j):
                 cache_modifier=CM_DEV,
             )
         )
-        v0 = bf16_round(bf_lo(w) + row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(bf_hi(w) + row_sum(red, 2 * rp + 1, tt))
+        v0 = bf16_round(bf_lo(w) + v0)
+        v1 = bf16_round(bf_hi(w) + v1)
         put_final(c, row0 + 2 * rp, tt, v0, v1, sent_final)
     gpu.barrier()
 
@@ -1636,7 +1708,7 @@ def put_final(c, col, t, v0, v1, sent_final):
 
 @flyc.jit
 def stage_reduce(c, j):
-    """Columns 128 j ..: FINAL in rank order -> bf16 out (+ the updated prefix
+    """Columns RED_COLS j ..: FINAL in rank order -> bf16 out (+ the updated prefix
     under ``fold``)."""
     sent_final = c.get("sent_final", False)
     s, tid = c["S"], c["tid"]
@@ -1644,13 +1716,15 @@ def stage_reduce(c, j):
     fold = c.get("fold", False)
     # the MoE launch has no prefix: only the layer launch's fold reads it
     prefix = c["args"]["prefix"] if fold else None
-    if tid < s * 64:
+    if tid < s * (RED_COLS // 2):
         if const_expr(sent_final):
             # consecutive threads read consecutive words
             t, cp = sent_item(tid, s)
         else:
-            t, cp = tid // 64, tid % 64
-        col = j * 128 + 2 * cp
+            t, cp = tid // (RED_COLS // 2), tid % (RED_COLS // 2)
+        col = j * RED_COLS + 2 * cp
+        if const_expr(fold):
+            pw = ld_i32(prefix, (t * HIDDEN + col) // 2, CM_DEV)
         if const_expr(sent_final):
             lo, hi = sent_sum(c["finals_own"], col, t, s, HIDDEN, TP, rearm=False)
         else:
@@ -1665,7 +1739,6 @@ def stage_reduce(c, j):
             # out + the updated prefix, as torch's bf16 add: each operand
             # rounded to bf16, the sum in fp32, rounded once more. The seam
             # stored the prefix device-coherent, causally before FINAL.
-            pw = ld_i32(prefix, (t * HIDDEN + col) // 2, CM_DEV)
             o_lo = bf16_round(bf16_round(lo) + bf_lo(pw))
             o_hi = bf16_round(bf16_round(hi) + bf_hi(pw))
         w = (
@@ -1726,7 +1799,7 @@ def build(key: MoeBuild):
 
     @fx.struct
     class Smem:
-        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        red: fx.Array[fx.Float32, 2 * RED_WORDS, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
         qslot: fx.Array[fx.Int32, 4, 16]
 
@@ -1905,7 +1978,7 @@ def build(key: MoeBuild):
         run_sdown_rest(c, bid, w_sd)
         # the shared down (needed only by up) on the CTAs with no down task:
         # after their ug, so every CTA's ug starts as the route lands
-        run_sdown(c, bid, w_sd)
+        run_sdown(c, bid, w_sd, h_ready=True)
         stamp(on, tls, tid, 4)
         if const_expr(key.stop <= 5):
             return

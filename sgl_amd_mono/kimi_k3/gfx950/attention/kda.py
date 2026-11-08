@@ -12,9 +12,10 @@ behind every earlier load):
                         (WGT); mix: the softmax mix, its partial sum of squares
                         (MSQ), every slice's -> output RMSNorm -> bf16 x rows
                         (plain device-scope stores, an XRDY flag a slice)
-    gemv CTAs 56 ..     in_proj, two 16-row groups each: the first group's
-                        weights issued at kernel start, the second's as x lands
-                        -> q|k|v|g|f_a|beta (PROJ)
+    gemv work           one late gate group on each AttnRes CTA after its x poll,
+                        one early group on CTAs 56 .. 95, and one or two groups
+                        on the rest; f_a / beta stay on preloaded single-group
+                        CTAs -> q|k|v|g|f_a|beta (PROJ)
     kda tasks           (R x 12 heads x 8 v-chunks) on CTAs 0 ..: inputs that
                         need no hand-off loaded first (metadata, conv window,
                         state rows, f_b rows), then conv update of the owned
@@ -100,12 +101,33 @@ NKCH = HIDDEN // KCH  # 56
 PER_WAVE = NKCH // WAVES  # 7
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
+RB_KDA_CTAS = NH * NVCH - NA
+RB_MAIN0 = RB_KDA_CTAS
+RB_MAIN_CTAS = BLOCKS - NA - RB_KDA_CTAS
+RB_GATE_LATE0 = G2_0 // ROWS + PROJ // ROWS - NA
+RB_SPECIAL0 = FA_0 // ROWS
+RB_SPECIAL_TASKS = GEMV_TASKS - RB_SPECIAL0
+RB_MAIN_TASKS = RB_GATE_LATE0 - RB_MAIN0 + RB_SPECIAL_TASKS
+RB_MAIN_PAIRS = RB_MAIN_TASKS - RB_MAIN_CTAS
+RB_MAIN_SINGLES = RB_MAIN_CTAS - RB_MAIN_PAIRS
+RB_MAIN_GATE_SINGLES = RB_GATE_LATE0 - (RB_MAIN0 + 2 * RB_MAIN_PAIRS)
 CONV_W = 4
 # timeline points: start, slice, gate, mix, load_x, gemv0, gemv1, k.stage,
 # k.conv, k.gates, k.recur, k.norm
 TL_POINTS = 15
 
 assert NA + GEMV_CTAS <= BLOCKS and NA == 8 * GSL
+assert (
+    RB_KDA_CTAS == 40
+    and RB_MAIN_PAIRS >= 0
+    and RB_MAIN_SINGLES >= 0
+    and RB_MAIN_PAIRS + RB_MAIN_SINGLES == RB_MAIN_CTAS
+    and 2 * RB_MAIN_PAIRS + RB_MAIN_SINGLES == RB_MAIN_TASKS
+    and RB_MAIN_GATE_SINGLES >= 0
+    and RB_MAIN_GATE_SINGLES + RB_SPECIAL_TASKS == RB_MAIN_SINGLES
+    and RB_GATE_LATE0 + NA == RB_SPECIAL0
+    and RB_SPECIAL0 + RB_SPECIAL_TASKS == GEMV_TASKS
+)
 
 _STREAM = fx.Stream(None)
 # every mono source file: in every build's JIT cache key
@@ -134,6 +156,7 @@ class KdaPreBuild:
     # state, read and never written; each token's conv k / v, gate and beta go
     # to the ring rows SGLang's commit replays, instead of a state a token.
     ring: bool = False
+    rebalance: bool = True
 
 
 def scratch_layout(key: KdaPreBuild) -> dict:
@@ -262,6 +285,33 @@ def stage_gemv(c, rg, ops):
                 tt * NPROJ + rg * ROWS + r,
             )
     gpu.barrier()
+
+
+@flyc.jit
+def run_gemv_single(c, rg, preload=True):
+    if const_expr(preload):
+        ops = gemv_loads(c, rg, range(PER_WAVE))
+        load_x(c)
+    else:
+        load_x(c)
+        ops = gemv_loads(c, rg, range(PER_WAVE))
+    stamp(c["on"], c["tls"], c["tid"], 4)
+    stage_gemv(c, rg, ops)
+    stamp(c["on"], c["tls"], c["tid"], 5)
+    stamp(c["on"], c["tls"], c["tid"], 6)
+
+
+@flyc.jit
+def run_gemv_pair(c, rg0, rg1):
+    ops0 = gemv_loads(c, rg0, range(PER_WAVE))
+    load_x(c)
+    stamp(c["on"], c["tls"], c["tid"], 4)
+    ops1 = gemv_loads(c, rg1, range(4))
+    stage_gemv(c, rg0, ops0)
+    stamp(c["on"], c["tls"], c["tid"], 5)
+    ops1 = ops1 + gemv_loads(c, rg1, range(4, PER_WAVE))
+    stage_gemv(c, rg1, ops1)
+    stamp(c["on"], c["tls"], c["tid"], 6)
 
 
 # ---------------------------------------------------------------- kda
@@ -688,6 +738,7 @@ def build(key: KdaPreBuild):
             "write_idx": key.write_idx,
             "ring": key.ring,
             "init_committed": key.init_committed,
+            "rebalance": key.rebalance and s // L == 1 and key.kda0 == 0,
             "gate_local": False,
             "put": mb.put,
             "poll": mb.poll,
@@ -755,20 +806,39 @@ def build(key: KdaPreBuild):
             stamp(on, tls, tid, 2)
             stage_mix(c, bid)
             stamp(on, tls, tid, 3)
-        if bid >= NA:
-            gi = bid - NA
-            rg0 = 2 * gi
-            rg1 = 2 * gi + 1
-            ops0 = gemv_loads(c, rg0, range(PER_WAVE))
-            load_x(c)
-            stamp(on, tls, tid, 4)
-            # the second group's first half in flight under the first's MFMAs
-            ops1 = gemv_loads(c, rg1, range(4))
-            stage_gemv(c, rg0, ops0)
-            stamp(on, tls, tid, 5)
-            ops1 = ops1 + gemv_loads(c, rg1, range(4, PER_WAVE))
-            stage_gemv(c, rg1, ops1)
-            stamp(on, tls, tid, 6)
+        if const_expr(c["rebalance"]):
+            if bid < NA:
+                run_gemv_single(c, RB_GATE_LATE0 + bid, preload=False)
+            elif bid < NA + RB_KDA_CTAS:
+                run_gemv_single(c, bid - NA)
+            else:
+                main = bid - NA - RB_KDA_CTAS
+                if main < RB_MAIN_PAIRS:
+                    rg0 = RB_MAIN0 + 2 * main
+                    run_gemv_pair(c, rg0, rg0 + 1)
+                else:
+                    single = main - RB_MAIN_PAIRS
+                    if single < RB_MAIN_GATE_SINGLES:
+                        run_gemv_single(c, RB_MAIN0 + 2 * RB_MAIN_PAIRS + single)
+                    else:
+                        run_gemv_single(
+                            c, RB_SPECIAL0 + single - RB_MAIN_GATE_SINGLES
+                        )
+        else:
+            if bid >= NA:
+                gi = bid - NA
+                rg0 = 2 * gi
+                rg1 = 2 * gi + 1
+                ops0 = gemv_loads(c, rg0, range(PER_WAVE))
+                load_x(c)
+                stamp(on, tls, tid, 4)
+                # the second group's first half in flight under the first's MFMAs
+                ops1 = gemv_loads(c, rg1, range(4))
+                stage_gemv(c, rg0, ops0)
+                stamp(on, tls, tid, 5)
+                ops1 = ops1 + gemv_loads(c, rg1, range(4, PER_WAVE))
+                stage_gemv(c, rg1, ops1)
+                stamp(on, tls, tid, 6)
         kda_tasks(c, on, tls)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 

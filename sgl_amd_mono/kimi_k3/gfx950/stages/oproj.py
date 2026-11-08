@@ -125,32 +125,35 @@ def scratch_bytes(key: AttnPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
-def o_loads(c, rg):
-    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12): a lane
-    64 B of its row a chunk."""
+def o_load_chunk(c, rg, i):
+    """One of this wave's two K chunks: a lane loads 64 B of its row."""
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_o"])
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
-    out = []
-    for i in range(2):
-        ch = fx.min(wave + WAVES * i, OKCH - 1)
-        base = (row * OK + ch * 128 + g * 8) // 2
-        out.append(
-            [
-                fx.Vector(
-                    bo.buffer_load(
-                        r_w,
-                        base + 16 * q,
-                        vec_width=4,
-                        dtype=T.i32,
-                        cache_modifier=CM_NT,
-                    )
-                )
-                for q in range(4)
-            ]
+    ch = fx.min(wave + WAVES * i, OKCH - 1)
+    base = (row * OK + ch * 128 + g * 8) // 2
+    return [
+        fx.Vector(
+            bo.buffer_load(
+                r_w,
+                base + 16 * q,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=CM_NT,
+            )
         )
-    return out
+        for q in range(4)
+    ]
+
+
+def o_loads(c, rg):
+    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12)."""
+    return [o_load_chunk(c, rg, i) for i in range(2)]
+
+
+def o_zero_chunk():
+    return [fx.Vector.filled(4, 0, fx.Int32) for _ in range(4)]
 
 
 @flyc.jit
@@ -172,38 +175,38 @@ def load_core(c):
 
 
 @flyc.jit
-def stage_o(c, rg, ops):
-    """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region, this
-    rank's slot (thread: token, row pair; a put a peer)."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    # read before the traced branches (a dict lookup inside one is carried state)
-    sent_ar = c.get("sent_ar", False)
+def stage_o_compute(c, rg, ops, red):
+    s, lane, wave = c["S"], c["lane"], c["wave"]
     g = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
-    row = OK + LDS_PAD
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(2):
         ch = wave + WAVES * i
         live = ch < OKCH
         k = fx.min(ch, OKCH - 1) * 128 + g * 8
-        for q in range_constexpr(4):
-            xb = fx.Vector(
-                fx.ptr_load(
-                    c["xl"] + (t * row + k + 32 * q) // 2,
-                    result_type=fx.Vector.make_type(4, fx.Int32),
+        if live:
+            for q in range_constexpr(4):
+                xb = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(c["args"]["core"]),
+                        (t * OK + k + 32 * q) // 2,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
                 )
-            )
-            xb = fx.Vector.from_elements(
-                [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
-            )
-            acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
-            )
+                acc = mfma_bf16(
+                    ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+                )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < s * (ROWS // 2):
-        tt = tid // (ROWS // 2)
-        rp = tid % (ROWS // 2)
+
+
+@flyc.jit
+def stage_o_epilogue(c, rg, red, eid):
+    s = c["S"]
+    sent_ar = c.get("sent_ar", False)
+    if eid < s * (ROWS // 2):
+        tt = eid // (ROWS // 2)
+        rp = eid % (ROWS // 2)
         v0 = bf16_round(row_sum(red, 2 * rp, tt))
         v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
         if const_expr(sent_ar):
@@ -215,6 +218,64 @@ def stage_o(c, rg, ops):
             at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
             for p in range_constexpr(TP):
                 c["put_bf"](c["ar_peer"][p], at, [v0, v1])
+
+
+@flyc.jit
+def stage_o(c, rg, ops):
+    """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region."""
+    red = c["red"]
+    stage_o_compute(c, rg, ops, red)
+    gpu.barrier()
+    stage_o_epilogue(c, rg, red, c["tid"])
+    gpu.barrier()
+
+
+@flyc.jit
+def stage_o_no_trailing_barrier(c, rg, ops):
+    """The next reduce barrier also protects red before its next use."""
+    red = c["red"]
+    stage_o_compute(c, rg, ops, red)
+    gpu.barrier()
+    stage_o_epilogue(c, rg, red, c["tid"])
+
+
+@flyc.jit
+def stage_o_pair(c, rg, ops):
+    """Share each core tile between two tasks and drain both epilogues at once."""
+    s, lane, wave, red = c["S"], c["lane"], c["wave"], c["red"]
+    g = lane // ROWS
+    t = fx.min(lane % ROWS, s - 1)
+    row = OK + LDS_PAD
+    acc0 = fx.Vector.filled(4, 0.0, fx.Float32)
+    acc1 = fx.Vector.filled(4, 0.0, fx.Float32)
+    for i in range_constexpr(2):
+        ch = wave + WAVES * i
+        live = ch < OKCH
+        k = fx.min(ch, OKCH - 1) * 128 + g * 8
+        if live:
+            for q in range_constexpr(4):
+                xb = fx.Vector(
+                    fx.ptr_load(
+                        c["xl"] + (t * row + k + 32 * q) // 2,
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+                acc0 = mfma_bf16(
+                    ops[0][i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc0
+                )
+                acc1 = mfma_bf16(
+                    ops[1][i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc1
+                )
+    fx.ptr_store(acc0, red + (wave * 64 + lane) * 4)
+    fx.ptr_store(acc1, red + (WAVES * 64 + wave * 64 + lane) * 4)
+    gpu.barrier()
+    n = c["S"] * (ROWS // 2)
+    tid = c["tid"]
+    if tid < 2 * n:
+        j = tid // n
+        stage_o_epilogue(
+            c, rg + GEMV_N * j, red + j * (WAVES * 64 * 4), tid % n
+        )
     gpu.barrier()
 
 
